@@ -33,30 +33,56 @@ if(Legion_VERSION STREQUAL "")
     execute_process(COMMAND ${GIT_EXECUTABLE} describe --dirty --match legion*
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       RESULT_VARIABLE _git_result
-      OUTPUT_VARIABLE Legion_VERSION
+      OUTPUT_VARIABLE Legion_GIT_VERSION
       ERROR_QUIET
       OUTPUT_STRIP_TRAILING_WHITESPACE)
   else()
     set(_git_result -1)
   endif()
   if(_git_result EQUAL 0)
-    message(STATUS "Version string from git: ${Legion_VERSION}")
+    message(STATUS "Version string from git: ${Legion_GIT_VERSION}")
   else()
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION)
       file(READ ${CMAKE_CURRENT_SOURCE_DIR}/VERSION _file_contents)
-      string(STRIP "${_file_contents}" Legion_VERSION)
+      string(STRIP "${_file_contents}" Legion_GIT_VERSION)
       unset(_file_contents)
-      message(STATUS "Version string from VERSION file: ${Legion_VERSION}")
+      message(STATUS "Version string from VERSION file: ${Legion_GIT_VERSION}")
     else()
-      set(Legion_VERSION "unknown")
+      set(Legion_GIT_VERSION "22.05.00")
       message(WARNING "Could not determine version string - using 'unknown'")
     endif()
   endif()
   unset(_git_result)
+
+  # these are the actual variables that are written into the headers
+  set(LEGION_VERSION "${Legion_GIT_VERSION}")
+  set(REALM_VERSION "${Legion_GIT_VERSION}")
+
+  # Parse the major.minor.patch from Legion_GIT_VERSION
+  if(Legion_GIT_VERSION MATCHES "([0-9]+)\\.([0-9]+)\\.([0-9]+)") # get the CMake version
+    set(Legion_VERSION_MAJOR "${CMAKE_MATCH_1}")
+    set(Legion_VERSION_MINOR "${CMAKE_MATCH_2}")
+    set(Legion_VERSION_PATCH "${CMAKE_MATCH_3}")
+    if(NOT Legion_VERSION_MAJOR VERSION_EQUAL 0)
+      string(REGEX REPLACE "^0+" "" Legion_VERSION_MAJOR "${Legion_VERSION_MAJOR}")
+    endif()
+    if(NOT Legion_VERSION_MINOR VERSION_EQUAL 0)
+      string(REGEX REPLACE "^0+" "" Legion_VERSION_MINOR "${Legion_VERSION_MINOR}")
+    endif()
+    if(NOT Legion_VERSION_PATCH VERSION_EQUAL 0)
+      string(REGEX REPLACE "^0+" "" Legion_VERSION_PATCH "${Legion_VERSION_PATCH}")
+    endif()
+    set(Legion_VERSION "${Legion_VERSION_MAJOR}.${Legion_VERSION_MINOR}.${Legion_VERSION_PATCH}")
+  else()
+    set(Legion_VERSION "${Legion_GIT_VERSION}")
+  endif()
+else()
+  # these are the actual variables that are written into the headers
+  set(LEGION_VERSION "${Legion_VERSION}")
+  set(REALM_VERSION "${Legion_VERSION}")
 endif()
-# these are the actual variables that are written into the headers
-set(LEGION_VERSION "${Legion_VERSION}")
-set(REALM_VERSION "${Legion_VERSION}")
+
+message(VERBOSE "Legion: Legion_VERSION=${Legion_VERSION}")
 
 project(Legion VERSION ${Legion_VERSION})
 
