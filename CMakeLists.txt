@@ -31,7 +31,7 @@ if(Legion_VERSION STREQUAL "")
   find_package(Git)
   if(GIT_FOUND)
     execute_process(COMMAND ${GIT_EXECUTABLE} describe --dirty --match legion*
-      WORKING_DIRECTORY ${Legion_SOURCE_DIR}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       RESULT_VARIABLE _git_result
       OUTPUT_VARIABLE Legion_VERSION
       ERROR_QUIET
@@ -42,8 +42,8 @@ if(Legion_VERSION STREQUAL "")
   if(_git_result EQUAL 0)
     message(STATUS "Version string from git: ${Legion_VERSION}")
   else()
-    if(EXISTS ${Legion_SOURCE_DIR}/VERSION)
-      file(READ ${Legion_SOURCE_DIR}/VERSION _file_contents)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION)
+      file(READ ${CMAKE_CURRENT_SOURCE_DIR}/VERSION _file_contents)
       string(STRIP "${_file_contents}" Legion_VERSION)
       unset(_file_contents)
       message(STATUS "Version string from VERSION file: ${Legion_VERSION}")
