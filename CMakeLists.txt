@@ -15,30 +15,6 @@
 #------------------------------------------------------------------------------#
 
 cmake_minimum_required(VERSION 3.7)
-project(Legion VERSION 22.05.00)
-
-#------------------------------------------------------------------------------#
-# Some boilerplate to setup nice output directories
-#------------------------------------------------------------------------------#
-
-#for multilib distros
-include(GNUInstallDirs)
-
-list(INSERT CMAKE_MODULE_PATH 0 "${Legion_SOURCE_DIR}/cmake")
-if(NOT CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
-  set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${Legion_BINARY_DIR}/lib)
-endif()
-if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
-  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${Legion_BINARY_DIR}/lib)
-endif()
-if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
-  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${Legion_BINARY_DIR}/bin)
-endif()
-
-#library api version, bump from time to time
-set(SOVERSION 1)
-
-set(INSTALL_SUFFIX "" CACHE STRING "Suffix to add to installed libraries and binaries")
 
 #------------------------------------------------------------------------------#
 # Version information
@@ -81,6 +57,31 @@ endif()
 # these are the actual variables that are written into the headers
 set(LEGION_VERSION "${Legion_VERSION}")
 set(REALM_VERSION "${Legion_VERSION}")
+
+project(Legion VERSION ${Legion_VERSION})
+
+#------------------------------------------------------------------------------#
+# Some boilerplate to setup nice output directories
+#------------------------------------------------------------------------------#
+
+#for multilib distros
+include(GNUInstallDirs)
+
+list(INSERT CMAKE_MODULE_PATH 0 "${Legion_SOURCE_DIR}/cmake")
+if(NOT CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
+  set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${Legion_BINARY_DIR}/lib)
+endif()
+if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${Legion_BINARY_DIR}/lib)
+endif()
+if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${Legion_BINARY_DIR}/bin)
+endif()
+
+#library api version, bump from time to time
+set(SOVERSION 1)
+
+set(INSTALL_SUFFIX "" CACHE STRING "Suffix to add to installed libraries and binaries")
 
 #------------------------------------------------------------------------------#
 # Build type and shared vs static library
