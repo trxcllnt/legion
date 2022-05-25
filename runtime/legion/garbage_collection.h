@@ -85,11 +85,12 @@ namespace Legion {
       TRACE_REF = 26,
       AGGREGATOR_REF = 27,
       FIELD_STATE_REF = 28,
-      CANONICAL_REF = 29,
-      DISJOINT_COMPLETE_REF = 30,
-      REPLICATION_REF = 31,
-      PHYSICAL_ANALYSIS_REF = 32,
-      LAST_SOURCE_REF = 33,
+      COPY_ACROSS_REF = 29,
+      CANONICAL_REF = 30,
+      DISJOINT_COMPLETE_REF = 31,
+      REPLICATION_REF = 32,
+      PHYSICAL_ANALYSIS_REF = 33,
+      LAST_SOURCE_REF = 34,
     };
 
     enum ReferenceKind {
@@ -129,6 +130,7 @@ namespace Legion {
       "Physical Trace Reference",                   \
       "Aggregator Reference",                       \
       "Field State Reference",                      \
+      "Copy Across Executor Reference",             \
       "Canonical Index Space Expression Reference", \
       "Disjoint Complete Reference",                \
       "Replication Reference",                      \
@@ -284,15 +286,13 @@ namespace Legion {
     public:
       class UnregisterFunctor {
       public:
-        UnregisterFunctor(Runtime *rt, const DistributedID d,
-                          std::set<RtEvent> &done)
-          : runtime(rt), did(d), done_events(done) { }
+        UnregisterFunctor(Runtime *rt, Serializer &r)
+          : runtime(rt), rez(r) { }
       public:
         void apply(AddressSpaceID target);
       protected:
         Runtime *const runtime;
-        const DistributedID did;
-        std::set<RtEvent> &done_events;
+        Serializer &rez;
       };
       struct DeferRemoteReferenceUpdateArgs : 
         public LgTaskArgs<DeferRemoteReferenceUpdateArgs> {
@@ -319,7 +319,6 @@ namespace Legion {
       public:
         DeferRemoteUnregisterArgs(DistributedID id, const NodeSet &nodes);
       public:
-        const RtUserEvent done;
         const DistributedID did;
         NodeSet *const nodes;
       };
@@ -427,13 +426,14 @@ namespace Legion {
       template<typename FUNCTOR>
       inline void map_over_remote_instances(FUNCTOR &functor);
     public:
-      // This is for the owner node only
       void register_with_runtime(ReferenceMutator *mutator,
                                  bool notify_remote = true);
+      bool confirm_deletion(void);
     protected:
-      void unregister_with_runtime(void) const;
-      RtEvent send_unregister_messages(void) const;
-      void send_unregister_mapping(std::set<RtEvent> &done_events) const;
+      bool try_unregister(void);
+      bool unregister_with_runtime(void) const;
+      void send_unregister_messages(void) const;
+      void send_unregister_mapping(void) const;
     public:
       // This for remote nodes only
       void unregister_collectable(std::set<RtEvent> &done_events);

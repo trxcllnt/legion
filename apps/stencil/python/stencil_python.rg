@@ -14,7 +14,7 @@
 
 -- runs-with:
 -- [
---   ["-ll:cpu", "4", "-ll:py", "1", "-ll:pyimport", "stencil"]
+--   ["-ll:cpu", "4", "-ll:py", "1", "-ll:pyimport", "stencil", "-foverride-demand-cuda", "1"]
 -- ]
 
 package.terrapath = package.terrapath .. ";" .. (arg[0]:match(".*/") or "./") .. "../../../language/examples/?.rg"

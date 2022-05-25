@@ -2215,6 +2215,9 @@ namespace Legion {
     public:
       virtual const DomainPoint& get_domain_point(void) const = 0;
       virtual void set_projection_result(unsigned idx,LogicalRegion result) = 0;
+      virtual void record_intra_space_dependences(unsigned idx,
+                               const std::vector<DomainPoint> &region_deps) = 0;
+      virtual const Mappable* as_mappable(void) const = 0;
     }; 
 
     /**
@@ -2282,6 +2285,10 @@ namespace Legion {
       void check_inversion(const Task *task, unsigned idx,
                            const std::vector<DomainPoint> &ordered_points);
       void check_containment(const Task *task, unsigned idx,
+                             const std::vector<DomainPoint> &ordered_points);
+      void check_inversion(const Mappable *mappable, unsigned idx,
+                           const std::vector<DomainPoint> &ordered_points);
+      void check_containment(const Mappable *mappable, unsigned idx,
                              const std::vector<DomainPoint> &ordered_points);
     public:
       bool is_complete(RegionTreeNode *node, Operation *op, 
@@ -2526,15 +2533,6 @@ namespace Legion {
         size_t prof_target_latency;
       };
     public:
-      struct DeferredRecycleArgs : public LgTaskArgs<DeferredRecycleArgs> {
-      public:
-        static const LgTaskID TASK_ID = LG_DEFERRED_RECYCLE_ID;
-      public:
-        DeferredRecycleArgs(DistributedID id)
-          : LgTaskArgs<DeferredRecycleArgs>(implicit_provenance), did(id) { }
-      public:
-        const DistributedID did;
-      }; 
       struct TopFinishArgs : public LgTaskArgs<TopFinishArgs> {
       public:
         static const LgTaskID TASK_ID = LG_TOP_FINISH_TASK_ID;
@@ -3248,9 +3246,11 @@ namespace Legion {
                                                  Serializer &rez);
       void send_compute_equivalence_sets_response(AddressSpaceID target,
                                                   Serializer &rez);
+      void send_cancel_equivalence_sets_subscription(AddressSpaceID target,
+                                                     Serializer &rez);
+      void send_finish_equivalence_sets_subscription(AddressSpaceID target,
+                                                     Serializer &rez);
       void send_equivalence_set_response(AddressSpaceID target,Serializer &rez);
-      void send_equivalence_set_invalidate_trackers(AddressSpaceID target,
-                                                    Serializer &rez);
       void send_equivalence_set_replication_request(AddressSpaceID target,
                                                     Serializer &rez);
       void send_equivalence_set_replication_response(AddressSpaceID target,
@@ -3544,12 +3544,16 @@ namespace Legion {
       void handle_remote_context_physical_response(Deserializer &derez);
       void handle_compute_equivalence_sets_request(Deserializer &derez, 
                                                    AddressSpaceID source);
-      void handle_compute_equivalence_sets_response(Deserializer &derez);
+      void handle_compute_equivalence_sets_response(Deserializer &derez,
+                                                    AddressSpaceID source);
+      void handle_cancel_equivalence_sets_subscription(Deserializer &derez,
+                                                       AddressSpaceID source);
+      void handle_finish_equivalence_sets_subscription(Deserializer &derez,
+                                                       AddressSpaceID source);
       void handle_equivalence_set_request(Deserializer &derez,
                                           AddressSpaceID source);
       void handle_equivalence_set_response(Deserializer &derez,
                                            AddressSpaceID source);
-      void handle_equivalence_set_invalidate_trackers(Deserializer &derez);
       void handle_equivalence_set_replication_request(Deserializer &derez);
       void handle_equivalence_set_replication_response(Deserializer &derez);
       void handle_equivalence_set_replication_update(Deserializer &derez);
@@ -3751,13 +3755,11 @@ namespace Legion {
                                    RtEvent precondition = RtEvent::NO_RT_EVENT);
     public:
       DistributedID get_available_distributed_id(void); 
-      void free_distributed_id(DistributedID did);
-      RtEvent recycle_distributed_id(DistributedID did, RtEvent recycle_event);
       AddressSpaceID determine_owner(DistributedID did) const;
     public:
       void register_distributed_collectable(DistributedID did,
                                             DistributedCollectable *dc);
-      void unregister_distributed_collectable(DistributedID did);
+      bool unregister_distributed_collectable(DistributedID did);
       bool has_distributed_collectable(DistributedID did);
       DistributedCollectable* find_distributed_collectable(DistributedID did);
       DistributedCollectable* find_distributed_collectable(DistributedID did,
@@ -4278,10 +4280,7 @@ namespace Legion {
       mutable LocalLock processor_mapping_lock;
       std::map<Processor,unsigned> processor_mapping;
     protected:
-      mutable LocalLock distributed_id_lock;
-      DistributedID unique_distributed_id;
-      LegionDeque<DistributedID,
-          RUNTIME_DISTRIBUTED_ALLOC> available_distributed_ids;
+      std::atomic<DistributedID> unique_distributed_id;
     protected:
       mutable LocalLock distributed_collectable_lock;
       LegionMap<DistributedID,DistributedCollectable*,
@@ -5655,11 +5654,13 @@ namespace Legion {
           break;
         case SEND_COMPUTE_EQUIVALENCE_SETS_RESPONSE:
           break;
+        case SEND_CANCEL_EQUIVALENCE_SETS_SUBSCRIPTION:
+          break;
+        case SEND_FINISH_EQUIVALENCE_SETS_SUBSCRIPTION:
+          break;
         case SEND_EQUIVALENCE_SET_REQUEST:
           break;
         case SEND_EQUIVALENCE_SET_RESPONSE:
-          break;
-        case SEND_EQUIVALENCE_SET_INVALIDATE_TRACKERS:
           break;
         case SEND_EQUIVALENCE_SET_REPLICATION_REQUEST:
           break;

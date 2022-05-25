@@ -1911,7 +1911,8 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     PhysicalTrace::PhysicalTrace(Runtime *rt, LegionTrace *lt)
-      : runtime(rt), logical_trace(lt),
+      : runtime(rt), logical_trace(lt), perform_fence_elision(
+          !(runtime->no_trace_optimization || runtime->no_fence_elision)),
         repl_ctx(dynamic_cast<ReplicateContext*>(lt->ctx)),
         previous_replay(NULL), current_template(NULL), nonreplayable_count(0),
         new_template_count(0),
@@ -1934,19 +1935,6 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    PhysicalTrace::PhysicalTrace(const PhysicalTrace &rhs)
-      : runtime(NULL), logical_trace(NULL), repl_ctx(NULL), 
-        previous_replay(NULL), current_template(NULL), nonreplayable_count(0),
-        new_template_count(0),
-        previous_template_completion(ApEvent::NO_AP_EVENT),
-        execution_fence_event(ApEvent::NO_AP_EVENT)
-    //--------------------------------------------------------------------------
-    {
-      // should never be called
-      assert(false);
-    }
-
-    //--------------------------------------------------------------------------
     PhysicalTrace::~PhysicalTrace()
     //--------------------------------------------------------------------------
     {
@@ -1954,15 +1942,6 @@ namespace Legion {
            templates.begin(); it != templates.end(); ++it)
         delete (*it);
       templates.clear();
-    }
-
-    //--------------------------------------------------------------------------
-    PhysicalTrace& PhysicalTrace::operator=(const PhysicalTrace &rhs)
-    //--------------------------------------------------------------------------
-    {
-      // should never be called
-      assert(false);
-      return *this;
     }
 
     //--------------------------------------------------------------------------
@@ -2164,8 +2143,10 @@ namespace Legion {
 #endif
       // If we had an intermeidate execution fence between replays then
       // we should no longer be considered recurrent when we replay the trace
-      current_template->initialize_replay(fence_completion,
-                                   recurrent && !intermediate_execution_fence);
+      // We're also not going to be considered recurrent here if we didn't
+      // do fence elision since since we'll still need to track the fence
+      current_template->initialize_replay(fence_completion, 
+          recurrent && perform_fence_elision && !intermediate_execution_fence);
       // Reset this for the next replay
       intermediate_execution_fence = false;
     }
@@ -3229,19 +3210,20 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     TraceConditionSet::TraceConditionSet(PhysicalTrace *trace,
-                        RegionTreeForest *f, IndexSpaceExpression *expr,
-                        const FieldMask &mask, const std::set<RegionNode*> &rgs)
+                   RegionTreeForest *f, RegionNode *node, const FieldMask &mask,
+                   std::vector<RtEvent> &ready_events)
       : context(trace->logical_trace->ctx), forest(f),
-        condition_expr(expr), condition_mask(mask), 
-        regions(std::vector<RegionNode*>(rgs.begin(), rgs.end())),
-        precondition_views(NULL), anticondition_views(NULL), 
+        region(node), condition_expr(region->row_source), condition_mask(mask),
+        invalid_mask(mask), precondition_views(NULL), anticondition_views(NULL),
         postcondition_views(NULL)
     //--------------------------------------------------------------------------
     {
       condition_expr->add_base_expression_reference(TRACE_REF);
-      for (std::vector<RegionNode*>::const_iterator it =
-            regions.begin(); it != regions.end(); it++)
-        (*it)->add_base_resource_ref(TRACE_REF);
+      LocalReferenceMutator mutator;
+      region->add_base_valid_ref(TRACE_REF, &mutator);
+      const RtEvent done = mutator.get_done_event();
+      if (done.exists())
+        ready_events.push_back(done);
     }
 
     //--------------------------------------------------------------------------
@@ -3289,10 +3271,8 @@ namespace Legion {
             unique_view_expressions.end(); it++) 
         if ((*it)->remove_base_expression_reference(TRACE_REF))
           delete (*it);
-      for (std::vector<RegionNode*>::const_iterator it = 
-            regions.begin(); it != regions.end(); it++)
-        if ((*it)->remove_base_resource_ref(TRACE_REF))
-          delete (*it);
+      if (region->remove_base_valid_ref(TRACE_REF))
+        delete region;
       if (condition_expr->remove_base_expression_reference(TRACE_REF))
         delete condition_expr;
       if (precondition_views != NULL)
@@ -3304,17 +3284,40 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void TraceConditionSet::add_tracker_reference(unsigned cnt)
+    void TraceConditionSet::record_subscription(VersionManager *owner,
+                                                AddressSpaceID space)
     //--------------------------------------------------------------------------
     {
-      add_reference(cnt);
+      const std::pair<VersionManager*,AddressSpaceID> key(owner,space);
+      AutoLock s_lock(set_lock);
+      if (subscription_owners.empty())
+        add_reference();
+      std::map<std::pair<VersionManager*,AddressSpaceID>,unsigned>::iterator
+        finder = subscription_owners.find(key);
+      if (finder == subscription_owners.end())
+        subscription_owners[key] = 1;
+      else
+        finder->second++;
     }
 
     //--------------------------------------------------------------------------
-    bool TraceConditionSet::remove_tracker_reference(unsigned cnt)
+    bool TraceConditionSet::finish_subscription(VersionManager *owner,
+                                                AddressSpaceID space)
     //--------------------------------------------------------------------------
     {
-      return remove_reference(cnt);
+      const std::pair<VersionManager*,AddressSpaceID> key(owner,space);
+      AutoLock s_lock(set_lock);
+      std::map<std::pair<VersionManager*,AddressSpaceID>,unsigned>::iterator
+        finder = subscription_owners.find(key);
+#ifdef DEBUG_LEGION
+      assert(finder != subscription_owners.end());
+      assert(finder->second > 0);
+#endif
+      if (--finder->second == 0)
+        subscription_owners.erase(finder);
+      if (!subscription_owners.empty())
+        return false;
+      return remove_reference();
     }
 
     //--------------------------------------------------------------------------
@@ -3322,7 +3325,6 @@ namespace Legion {
                                                    const FieldMask &mask)
     //--------------------------------------------------------------------------
     {
-      set->record_tracker(this, mask);
       AutoLock s_lock(set_lock);
       if (current_sets.insert(set, mask))
         set->add_base_resource_ref(TRACE_REF);
@@ -3338,36 +3340,28 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    bool TraceConditionSet::can_filter_context(ContextID filter_id) const
+    void TraceConditionSet::remove_equivalence_sets(const FieldMask &mask,
+                                  const FieldMaskSet<EquivalenceSet> &to_filter)
     //--------------------------------------------------------------------------
     {
-      return (filter_id == context->get_context_id());
-    }
-
-    //--------------------------------------------------------------------------
-    void TraceConditionSet::remove_equivalence_set(EquivalenceSet *set,
-                                                   const FieldMask &mask)
-    //--------------------------------------------------------------------------
-    {
+      AutoLock s_lock(set_lock);
+      invalid_mask |= mask;
+      for (FieldMaskSet<EquivalenceSet>::const_iterator it =
+            to_filter.begin(); it != to_filter.end(); it++)
       {
-        AutoLock s_lock(set_lock);
-        invalid_mask |= mask;
-        FieldMaskSet<EquivalenceSet>::iterator finder = current_sets.find(set);
-        // Might have already been removed as part of deleting the set
+        FieldMaskSet<EquivalenceSet>::iterator finder = 
+          current_sets.find(it->first);
         if (finder == current_sets.end())
-          return;
-#ifdef DEBUG_LEGION
-        assert(!(mask - finder->second));
-#endif
-        finder.filter(mask);
+          continue;
+        finder.filter(it->second);
         if (!finder->second)
+        {
           current_sets.erase(finder);
-        else
-          return;
+          if (it->first->remove_base_resource_ref(TRACE_REF))
+            assert(false); // should never end up deleting this here
+        }
       }
-      // Remove the reference if we removed the set from our current sets
-      if (set->remove_base_resource_ref(TRACE_REF))
-        delete set;
+      current_sets.tighten_valid_mask();
     }
 
     //--------------------------------------------------------------------------
@@ -3375,34 +3369,46 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       FieldMaskSet<EquivalenceSet> to_remove;
+      std::map<AddressSpaceID,std::vector<VersionManager*> > to_cancel;
       {
         AutoLock s_lock(set_lock);
-        if (current_sets.empty())
+        if (subscription_owners.empty())
+        {
+#ifdef DEBUG_LEGION
+          assert(current_sets.empty());
+#endif
           return;
+        }
+        // Copy and not remove since we need to see the acknowledgement
+        // before we know when it is safe to remove our references
+        for (std::map<std::pair<VersionManager*,AddressSpaceID>,unsigned>::
+              const_iterator it = subscription_owners.begin(); 
+              it != subscription_owners.end(); it++)
+          to_cancel[it->first.second].push_back(it->first.first);
         to_remove.swap(current_sets);
       }
+      cancel_subscriptions(context->runtime, to_cancel);
       for (FieldMaskSet<EquivalenceSet>::const_iterator it =
             to_remove.begin(); it != to_remove.end(); it++)
-      {
-        it->first->remove_tracker(this, it->second);
         if (it->first->remove_base_resource_ref(TRACE_REF))
           delete it->first;
-      }
     }
 
     //--------------------------------------------------------------------------
-    void TraceConditionSet::capture(EquivalenceSet *set, 
-                                    std::set<RtEvent> &ready_events)
+    void TraceConditionSet::capture(EquivalenceSet *set, const FieldMask &mask,
+                                    std::vector<RtEvent> &ready_events)
     //--------------------------------------------------------------------------
     {
-      set->record_tracker(this, condition_mask);
-      if (current_sets.insert(set, condition_mask))
-        set->add_base_resource_ref(TRACE_REF);
+#ifdef DEBUG_LEGION
+      assert(precondition_views == NULL);
+      assert(anticondition_views == NULL);
+      assert(postcondition_views == NULL);
+#endif
       const RtEvent ready_event = 
-        set->capture_trace_conditions(this, set->local_space, condition_expr, 
-                              condition_mask, RtUserEvent::NO_RT_USER_EVENT); 
+        set->capture_trace_conditions(this, set->local_space,
+            condition_expr, mask, RtUserEvent::NO_RT_USER_EVENT);
       if (ready_event.exists() && !ready_event.has_triggered())
-        ready_events.insert(ready_event);
+        ready_events.push_back(ready_event);
     }
 
     //--------------------------------------------------------------------------
@@ -3523,11 +3529,10 @@ namespace Legion {
     void TraceConditionSet::dump_preconditions(void) const
     //--------------------------------------------------------------------------
     {
-#ifdef DEBUG_LEGION
-      assert(!regions.empty());
-#endif
+      if (precondition_views == NULL)
+        return;
       TraceViewSet dump_view_set(forest, 0/*owner did*/,
-          forest->get_tree(regions.front()->handle.get_tree_id()));
+          forest->get_tree(region->handle.get_tree_id()));
       LocalReferenceMutator mutator;
       for (ExprViews::const_iterator eit = 
             preconditions.begin(); eit != preconditions.end(); eit++)
@@ -3541,11 +3546,10 @@ namespace Legion {
     void TraceConditionSet::dump_anticonditions(void) const
     //--------------------------------------------------------------------------
     {
-#ifdef DEBUG_LEGION
-      assert(!regions.empty());
-#endif
+      if (anticondition_views == NULL)
+        return;
       TraceViewSet dump_view_set(forest, 0/*owner did*/,
-          forest->get_tree(regions.front()->handle.get_tree_id()));
+          forest->get_tree(region->handle.get_tree_id()));
       LocalReferenceMutator mutator;
       for (ExprViews::const_iterator eit = 
             anticonditions.begin(); eit != anticonditions.end(); eit++)
@@ -3559,11 +3563,10 @@ namespace Legion {
     void TraceConditionSet::dump_postconditions(void) const
     //--------------------------------------------------------------------------
     {
-#ifdef DEBUG_LEGION
-      assert(!regions.empty());
-#endif
+      if (postcondition_views == NULL)
+        return;
       TraceViewSet dump_view_set(forest, 0/*owner did*/,
-          forest->get_tree(regions.front()->handle.get_tree_id()));
+          forest->get_tree(region->handle.get_tree_id()));
       LocalReferenceMutator mutator;
       for (ExprViews::const_iterator eit = 
             postconditions.begin(); eit != postconditions.end(); eit++)
@@ -3584,7 +3587,8 @@ namespace Legion {
       // First check to see if we need to recompute our equivalence sets
       if (!!invalid_mask)
       {
-        const RtEvent ready = recompute_equivalence_sets(op);
+        const UniqueID opid = op->get_unique_op_id();
+        const RtEvent ready = recompute_equivalence_sets(opid);
         if (ready.exists() && !ready.has_triggered())
         {
           const RtUserEvent tested = Runtime::create_rt_user_event();
@@ -3717,7 +3721,8 @@ namespace Legion {
       // First check to see if we need to recompute our equivalence sets
       if (!!invalid_mask)
       {
-        const RtEvent ready = recompute_equivalence_sets(op);
+        const UniqueID opid = op->get_unique_op_id();
+        const RtEvent ready = recompute_equivalence_sets(opid);
         if (ready.exists() && !ready.has_triggered())
         {
           const RtUserEvent applied= Runtime::create_rt_user_event();
@@ -3783,26 +3788,18 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    RtEvent TraceConditionSet::recompute_equivalence_sets(Operation *op)
+    RtEvent TraceConditionSet::recompute_equivalence_sets(UniqueID opid)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
       assert(!!invalid_mask);
 #endif
       std::set<RtEvent> ready_events;
-      UniqueID opid = op->get_unique_op_id();
-      InnerContext *context = op->get_context();
       ContextID ctxid = context->get_context().get_id();
       AddressSpaceID space = forest->runtime->address_space;
-      for (std::vector<RegionNode*>::const_iterator it =
-            regions.begin(); it != regions.end(); it++)
-      {
-        IndexSpaceExpression *overlap = 
-          forest->intersect_index_spaces(condition_expr, (*it)->row_source);
-        (*it)->compute_equivalence_sets(ctxid, context, this, space, overlap,
-                                    invalid_mask, opid, space, ready_events,
-                                    false/*downward only*/, false/*covers*/);
-      }
+      region->compute_equivalence_sets(ctxid, context, this, space, 
+          condition_expr, invalid_mask, opid, space, ready_events,
+          false/*downward only*/, false/*covers*/);
       invalid_mask.clear();
       if (!ready_events.empty())
       {
@@ -3810,7 +3807,7 @@ namespace Legion {
         if (ready.exists() && !ready.has_triggered())
         {
           // Launch a meta-task to finalize this trace condition set
-          DeferTraceFinalizeSetsArgs args(this, op->get_unique_op_id());
+          DeferTraceFinalizeSetsArgs args(this, opid);
           return forest->runtime->issue_runtime_meta_task(args, 
                           LG_LATENCY_DEFERRED_PRIORITY, ready);
         }
@@ -3829,11 +3826,8 @@ namespace Legion {
         return;
       for (FieldMaskSet<EquivalenceSet>::const_iterator it =
             pending_sets.begin(); it != pending_sets.end(); it++)
-      {
-        it->first->record_tracker(this, it->second);
         if (current_sets.insert(it->first, it->second))
           it->first->add_base_resource_ref(TRACE_REF);
-      }
       pending_sets.clear();
     }
 
@@ -4030,74 +4024,62 @@ namespace Legion {
 
       if (has_virtual_mapping)
         return Replayable(false, "virtual mapping");
-
+      
+      // First let's get the equivalence sets with data for these regions
+      // We'll use the result to get guide the creation of the trace condition
+      // sets. Note we're going to end up recomputing the equivalence sets
+      // inside the trace condition sets but that is a small price to pay to
+      // minimize the number of conditions that we need to do the capture
       // Next we need to compute the equivalence sets for all these regions
-      LegionVector<VersionInfo> version_infos(trace_regions.size());
       unsigned index = 0;
-      std::set<RtEvent> ready_events;
+      std::set<RtEvent> eq_events;
       const ContextID ctx = context->get_context().get_id();
+      LegionVector<VersionInfo> version_infos(trace_regions.size());
       for (FieldMaskSet<RegionNode>::const_iterator it =
             trace_regions.begin(); it != trace_regions.end(); it++, index++)
         it->first->perform_versioning_analysis(ctx, context, 
             &version_infos[index], it->second, opid, 
-            trace->runtime->address_space, ready_events);
-      if (!ready_events.empty())
+            trace->runtime->address_space, eq_events);
+      trace_regions.clear();
+      if (!eq_events.empty())
       {
-        const RtEvent wait_on = Runtime::merge_events(ready_events);
-        ready_events.clear();
+        const RtEvent wait_on = Runtime::merge_events(eq_events);
         if (wait_on.exists() && !wait_on.has_triggered())
           wait_on.wait();
       }
-      // Compute the sets of regions and fields associated with each set
-      index = 0;
-      LegionMap<EquivalenceSet*,FieldMaskSet<RegionNode> > set_regions;
-      for (FieldMaskSet<RegionNode>::const_iterator rit =
-            trace_regions.begin(); rit != trace_regions.end(); rit++, index++)
+      FieldMaskSet<EquivalenceSet> current_sets;
+      for (unsigned idx = 0; idx < version_infos.size(); idx++)
       {
         const FieldMaskSet<EquivalenceSet> &region_sets = 
-            version_infos[index].get_equivalence_sets();
+            version_infos[idx].get_equivalence_sets();
         for (FieldMaskSet<EquivalenceSet>::const_iterator it = 
               region_sets.begin(); it != region_sets.end(); it++)
-          set_regions[it->first].insert(rit->first, it->second);
+          current_sets.insert(it->first, it->second);
       }
-      trace_regions.clear();
       // Make a trace condition set for each one of them
       // Note for control replication, we're just letting multiple shards 
       // race to their equivalence sets, whichever one gets there first for
       // their fields will be the one to own the preconditions
+      std::vector<RtEvent> ready_events;
+      conditions.reserve(current_sets.size()); 
       RegionTreeForest *forest = trace->runtime->forest;
-      for (LegionMap<EquivalenceSet*,
-                     FieldMaskSet<RegionNode> >::const_iterator eit =
-            set_regions.begin(); eit != set_regions.end(); eit++)
+      for (FieldMaskSet<EquivalenceSet>::const_iterator it = 
+            current_sets.begin(); it != current_sets.end(); it++)
       {
-        // Sort the region nodes into field groups so we can get a field 
-        // expression for each one of these
-        LegionList<FieldSet<RegionNode*> > region_fields;
-        eit->second.compute_field_sets(FieldMask(), region_fields);
-        for (LegionList<FieldSet<RegionNode*> >::iterator it =
-              region_fields.begin(); it != region_fields.end(); it++)
-        {
-          // The expression for this condition is the intersection of
-          // the equivalence set region with all the other regions that
-          // are represented by it
-          std::set<IndexSpaceExpression*> exprs;
-          for (std::set<RegionNode*>::const_iterator rit = 
-                it->elements.begin(); rit != it->elements.end(); rit++)
-            exprs.insert((*rit)->row_source);
-          IndexSpaceExpression *union_expr = forest->union_index_spaces(exprs);
-          IndexSpaceNode *eq_node = eit->first->region_node->row_source;
-          IndexSpaceExpression *condition_expr = 
-            forest->intersect_index_spaces(union_expr, eq_node);
-          // Small congruence test
-          if (condition_expr->get_volume() == eq_node->get_volume())
-            condition_expr = eq_node;
-          TraceConditionSet *condition = 
-            new TraceConditionSet(trace, forest, condition_expr, 
-                                  it->set_mask, it->elements);
-          condition->add_reference();
-          condition->capture(eit->first, ready_events);
-          conditions.push_back(condition);
-        }
+        TraceConditionSet *condition =
+          new TraceConditionSet(trace, forest, 
+              it->first->region_node, it->second, ready_events);
+        condition->add_reference();
+        // This looks redundant because it is a bit since we're just going
+        // to compute the single equivalence set we already have here but
+        // really what we're doing here is registering the condition with 
+        // the VersionManager that owns this equivalence set which is a
+        // necessary thing for us to do
+        const RtEvent ready = condition->recompute_equivalence_sets(opid);
+        if (ready.exists())
+          ready_events.push_back(ready);
+        condition->capture(it->first, it->second, ready_events);
+        conditions.push_back(condition);
       }
       // Wait for the conditions to be ready and then test them for subsumption
       if (!ready_events.empty())
@@ -4110,7 +4092,7 @@ namespace Legion {
       TraceViewSet::FailedPrecondition condition;
       // Need this lock in case we invalidate empty conditions
       AutoLock tpl_lock(template_lock);
-      for (std::vector<TraceConditionSet*>::iterator it = 
+      for (std::vector<TraceConditionSet*>::iterator it =
             conditions.begin(); it != conditions.end(); /*nothing*/)
       {
         if ((*it)->is_empty())
@@ -4170,7 +4152,8 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void PhysicalTemplate::execute_slice(unsigned slice_idx)
+    void PhysicalTemplate::execute_slice(unsigned slice_idx,
+                                         bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -4186,7 +4169,7 @@ namespace Legion {
       std::vector<Instruction*> &instructions = slices[slice_idx];
       for (std::vector<Instruction*>::const_iterator it = instructions.begin();
            it != instructions.end(); ++it)
-        (*it)->execute(events, user_events, ops);
+        (*it)->execute(events, user_events, ops, recurrent_replay);
       Runtime::trigger_event(NULL, fence);
     }
 
@@ -4246,8 +4229,7 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       std::vector<unsigned> gen;
-      if (!(trace->runtime->no_trace_optimization ||
-            trace->runtime->no_fence_elision))
+      if (trace->perform_fence_elision)
         elide_fences(gen, op);
       else
       {
@@ -4268,6 +4250,31 @@ namespace Legion {
       }
       prepare_parallel_replay(gen);
       push_complete_replays();
+      // After elide fences we can clear these views
+      op_views.clear();
+      copy_views.clear();
+      // Check to see if the indirection fields for any across copies are
+      // mutated during the execution of the trace. If they aren't then we
+      // know that we don't need to recompute preimages on back-to-back replays
+      if (!across_copies.empty())
+      {
+        for (std::vector<IssueAcross*>::const_iterator it =
+              across_copies.begin(); it != across_copies.end(); it++)
+        {
+          std::map<unsigned,ViewExprs>::iterator finder =
+            src_indirect_views.find((*it)->lhs);
+          if ((finder != src_indirect_views.end()) &&
+              are_read_only_users(finder->second))
+            (*it)->executor->record_trace_immutable_indirection(true/*src*/);
+          finder = dst_indirect_views.find((*it)->lhs);
+          if ((finder != dst_indirect_views.end()) &&
+              are_read_only_users(finder->second))
+            (*it)->executor->record_trace_immutable_indirection(false/*dst*/);
+        }
+        across_copies.clear();
+        src_indirect_views.clear();
+        dst_indirect_views.clear();
+      }
     }
 
     //--------------------------------------------------------------------------
@@ -4290,15 +4297,6 @@ namespace Legion {
               num_merges += generator_kind != MERGE_EVENT;
               break;
             }
-          case ISSUE_INDIRECT:
-            {
-              unsigned precondition_idx =
-                (*it)->as_issue_indirect()->precondition_idx;
-              InstructionKind generator_kind =
-                instructions[precondition_idx]->get_kind();
-              num_merges += generator_kind != MERGE_EVENT;
-              break;
-            }
           case ISSUE_FILL:
             {
               unsigned precondition_idx =
@@ -4306,6 +4304,35 @@ namespace Legion {
               InstructionKind generator_kind =
                 instructions[precondition_idx]->get_kind();
               num_merges += generator_kind != MERGE_EVENT;
+              break;
+            }
+          case ISSUE_ACROSS:
+            {
+              IssueAcross *across = (*it)->as_issue_across();
+              if (across->collective_precondition == 0)
+              {
+                InstructionKind generator_kind = 
+                  instructions[across->copy_precondition]->get_kind();
+                num_merges += (generator_kind != MERGE_EVENT) ? 1 : 0;
+              }
+              else
+              {
+                InstructionKind generator_kind = 
+                  instructions[across->collective_precondition]->get_kind();
+                num_merges += (generator_kind != MERGE_EVENT) ? 1 : 0;
+              }
+              if (across->src_indirect_precondition != 0)
+              {
+                InstructionKind generator_kind = 
+                  instructions[across->src_indirect_precondition]->get_kind();
+                num_merges += (generator_kind != MERGE_EVENT) ? 1 : 0;
+              }
+              if (across->dst_indirect_precondition != 0)
+              {
+                InstructionKind generator_kind = 
+                  instructions[across->dst_indirect_precondition]->get_kind();
+                num_merges += (generator_kind != MERGE_EVENT) ? 1 : 0;
+              }
               break;
             }
           case COMPLETE_REPLAY:
@@ -4339,8 +4366,6 @@ namespace Legion {
       {
         Instruction *inst = instructions[idx];
         InstructionKind kind = inst->get_kind();
-        std::set<unsigned> users;
-        unsigned *precondition_idx = NULL;
         std::set<RtEvent> ready_events;
         switch (kind)
         {
@@ -4350,8 +4375,10 @@ namespace Legion {
               std::map<TraceLocalID, ViewExprs>::iterator finder =
                 op_views.find(replay->owner);
               if (finder == op_views.end()) break;
+              std::set<unsigned> users;
               find_all_last_users(finder->second, users, ready_events);
-              precondition_idx = &replay->rhs;
+              rewrite_preconditions(replay->rhs, users, instructions, 
+                  new_instructions, gen, ready_events, merge_starts);
               break;
             }
           case ISSUE_COPY:
@@ -4362,36 +4389,11 @@ namespace Legion {
 #ifdef DEBUG_LEGION
               assert(finder != copy_views.end());
 #endif
+              std::set<unsigned> users;
               find_all_last_users(finder->second, users, ready_events);
-              precondition_idx = &copy->precondition_idx;
-              break;
-            }
-          case ISSUE_INDIRECT:
-            {
-              IssueIndirect *indirect = inst->as_issue_indirect();
-              std::map<unsigned, ViewExprs>::iterator finder =
-                copy_views.find(indirect->lhs);
-#ifdef DEBUG_LEGION
-              assert(finder != copy_views.end());
-#endif
-              find_all_last_users(finder->second, users, ready_events);
-              // This is super subtle: for indirections that are
-              // working collectively together on a set of indirect
-              // source or destination instances, we actually have
-              // a fan-in event construction. The indirect->precondition_idx
-              // points to the result of that fan-in tree which is not
-              // what we want to update here. We instead want to update
-              // the set of preconditions for our local instances for this
-              // part of the indirect which feed into the collective event
-              // tree construction. The local fan-in event is stored at
-              // indirect->trace_pre_idx so use that instead for this
-              precondition_idx = &indirect->tracing_pre_idx;
-#ifdef DEBUG_LEGION
-              // The tracing pre idx better be a merge event because
-              // we can't have it changing locations in the trace
-              assert(instructions[indirect->tracing_pre_idx]->get_kind() ==
-                      MERGE_EVENT);
-#endif
+              rewrite_preconditions(copy->precondition_idx, users,
+                  instructions, new_instructions, gen, 
+                  ready_events, merge_starts);
               break;
             }
           case ISSUE_FILL:
@@ -4402,42 +4404,72 @@ namespace Legion {
 #ifdef DEBUG_LEGION
               assert(finder != copy_views.end());
 #endif
+              std::set<unsigned> users;
               find_all_last_users(finder->second, users, ready_events);
-              precondition_idx = &fill->precondition_idx;
+              rewrite_preconditions(fill->precondition_idx, users,
+                  instructions, new_instructions, gen,
+                  ready_events, merge_starts);
+              break;
+            }
+          case ISSUE_ACROSS:
+            {
+              IssueAcross *across = inst->as_issue_across();
+              std::map<unsigned, ViewExprs>::iterator finder =
+                copy_views.find(across->lhs);
+#ifdef DEBUG_LEGION
+              assert(finder != copy_views.end());
+#endif
+              std::set<unsigned> users;
+              find_all_last_users(finder->second, users, ready_events);
+              // This is super subtle: for indirections that are
+              // working collectively together on a set of indirect
+              // source or destination instances, we actually have
+              // a fan-in event construction. The indirect->copy_precondition
+              // contains the result of that fan-in tree which is not
+              // what we want to update here. We instead want to update
+              // the set of preconditions to that collective fan-in for this
+              // part of the indirect which feed into the collective event
+              // tree construction. The local fan-in event is stored at
+              // indirect->collective_precondition so use that instead for this
+              if (across->collective_precondition == 0)
+                rewrite_preconditions(across->copy_precondition, users,
+                    instructions, new_instructions, gen, 
+                    ready_events, merge_starts);
+              else
+                rewrite_preconditions(across->collective_precondition, users,
+                    instructions, new_instructions, gen,
+                    ready_events, merge_starts);
+              // Also do the rewrites for any indirection preconditions
+              if (across->src_indirect_precondition != 0)
+              {
+                users.clear();
+                finder = src_indirect_views.find(across->lhs);
+#ifdef DEBUG_LEGION
+                assert(finder != src_indirect_views.end());
+#endif
+                find_all_last_users(finder->second, users, ready_events);
+                rewrite_preconditions(across->src_indirect_precondition, users,
+                    instructions, new_instructions, gen,
+                    ready_events, merge_starts);
+              }
+              if (across->dst_indirect_precondition != 0)
+              {
+                users.clear();
+                finder = dst_indirect_views.find(across->lhs);
+#ifdef DEBUG_LEGION
+                assert(finder != dst_indirect_views.end());
+#endif
+                find_all_last_users(finder->second, users, ready_events);
+                rewrite_preconditions(across->dst_indirect_precondition, users,
+                    instructions, new_instructions, gen,
+                    ready_events, merge_starts);
+              }
               break;
             }
           default:
             {
               break;
             }
-        }
-        // If we have any ready events then wait for them to be ready
-        if (!ready_events.empty())
-        {
-          const RtEvent wait_on = Runtime::merge_events(ready_events);
-          if (wait_on.exists() && !wait_on.has_triggered())
-            wait_on.wait();
-        }
-        // Now see if we have any users to update
-        if (users.size() > 0)
-        {
-          Instruction *generator_inst = instructions[*precondition_idx];
-          if (generator_inst->get_kind() == MERGE_EVENT)
-          {
-            MergeEvent *merge = generator_inst->as_merge_event();
-            merge->rhs.insert(users.begin(), users.end());
-          }
-          else
-          {
-            unsigned merging_event_idx = merge_starts++;
-            if (*precondition_idx != fence_completion_id)
-              users.insert(*precondition_idx);
-            gen[merging_event_idx] = new_instructions.size();
-            new_instructions.push_back(
-                new MergeEvent(*this, merging_event_idx, users,
-                               generator_inst->owner));
-            *precondition_idx = merging_event_idx;
-          }
         }
         gen[idx] = new_instructions.size();
         new_instructions.push_back(inst);
@@ -4450,6 +4482,43 @@ namespace Legion {
       // fence instruction at the beginning of the template
       if (events.size() > gen.size())
         gen.resize(events.size(), 0/*fence instruction*/);
+    }
+
+    //--------------------------------------------------------------------------
+    void PhysicalTemplate::rewrite_preconditions(
+                              unsigned &precondition, std::set<unsigned> &users,
+                              const std::vector<Instruction*> &instructions,
+                              std::vector<Instruction*> &new_instructions,
+                              std::vector<unsigned> &gen,
+                              std::set<RtEvent> &ready_events, 
+                              unsigned &merge_starts)
+    //--------------------------------------------------------------------------
+    {
+      // If we have any ready events then wait for them to be ready
+      if (!ready_events.empty())
+      {
+        const RtEvent wait_on = Runtime::merge_events(ready_events);
+        ready_events.clear();
+        if (wait_on.exists() && !wait_on.has_triggered())
+          wait_on.wait();
+      }
+      if (users.empty())
+        return;
+      Instruction *generator_inst = instructions[precondition];
+      if (generator_inst->get_kind() == MERGE_EVENT)
+      {
+        MergeEvent *merge = generator_inst->as_merge_event();
+        merge->rhs.insert(users.begin(), users.end());
+      }
+      else
+      {
+        unsigned merging_event_idx = merge_starts++;
+        gen[merging_event_idx] = new_instructions.size();
+        new_instructions.push_back(
+            new MergeEvent(*this, merging_event_idx, users,
+                           generator_inst->owner));
+        precondition = merging_event_idx;
+      }
     }
 
     //--------------------------------------------------------------------------
@@ -4506,12 +4575,16 @@ namespace Legion {
               used[gen[copy->precondition_idx]] = true;
               break;
             }
-          case ISSUE_INDIRECT:
+          case ISSUE_ACROSS:
             {
-              // See comment in elide_fences for why we use
-              // tracing_pre_idx instead of precondition_idx
-              IssueIndirect *indirect = inst->as_issue_indirect();
-              used[gen[indirect->tracing_pre_idx]] = true;
+              IssueAcross *across = inst->as_issue_across();
+              used[gen[across->copy_precondition]] = true;
+              if (across->collective_precondition != 0)
+                used[gen[across->collective_precondition]] = true;
+              if (across->src_indirect_precondition != 0)
+                used[gen[across->src_indirect_precondition]] = true;
+              if (across->dst_indirect_precondition != 0)
+                used[gen[across->dst_indirect_precondition]] = true;
               break;
             }
           case ISSUE_FILL:
@@ -4530,18 +4603,6 @@ namespace Legion {
             {
               CompleteReplay *complete = inst->as_complete_replay();
               used[gen[complete->rhs]] = true;
-              break;
-            }
-          case ACQUIRE_REPLAY:
-            {
-              AcquireReplay *acquire = inst->as_acquire_replay();
-              used[gen[acquire->rhs]] = true;
-              break;
-            }
-          case RELEASE_REPLAY:
-            {
-              ReleaseReplay *release = inst->as_release_replay();
-              used[gen[release->rhs]] = true;
               break;
             }
           case GET_TERM_EVENT:
@@ -4753,92 +4814,69 @@ namespace Legion {
         }
         else
         {
-          unsigned *event_to_check = NULL;
           switch (inst->get_kind())
           {
             case TRIGGER_EVENT:
               {
-                event_to_check = &inst->as_trigger_event()->rhs;
-                break;
-              }
-            case BARRIER_ARRIVAL:
-              {
-                event_to_check = &inst->as_barrier_arrival()->rhs;
+                parallelize_replay_event(inst->as_trigger_event()->rhs,
+                    slice_index, gen, slice_indices_by_inst,
+                    crossing_counts, crossing_instructions);
                 break;
               }
             case ISSUE_COPY:
               {
-                event_to_check = &inst->as_issue_copy()->precondition_idx;
-                break;
-              }
-            case ISSUE_INDIRECT:
-              {
-                event_to_check = &inst->as_issue_indirect()->precondition_idx;
+                parallelize_replay_event(
+                    inst->as_issue_copy()->precondition_idx,
+                    slice_index, gen, slice_indices_by_inst,
+                    crossing_counts, crossing_instructions);
                 break;
               }
             case ISSUE_FILL:
               {
-                event_to_check = &inst->as_issue_fill()->precondition_idx;
+                parallelize_replay_event(
+                    inst->as_issue_fill()->precondition_idx,
+                    slice_index, gen, slice_indices_by_inst,
+                    crossing_counts, crossing_instructions);
+                break;
+              }
+            case ISSUE_ACROSS:
+              {
+                IssueAcross *across = inst->as_issue_across();
+                parallelize_replay_event(across->copy_precondition,
+                    slice_index, gen, slice_indices_by_inst,
+                    crossing_counts, crossing_instructions);
+                if (across->collective_precondition != 0)
+                  parallelize_replay_event(across->collective_precondition,
+                      slice_index, gen, slice_indices_by_inst,
+                      crossing_counts, crossing_instructions);
+                if (across->src_indirect_precondition != 0)
+                  parallelize_replay_event(across->src_indirect_precondition,
+                      slice_index, gen, slice_indices_by_inst,
+                      crossing_counts, crossing_instructions);
+                if (across->dst_indirect_precondition != 0)
+                  parallelize_replay_event(across->dst_indirect_precondition,
+                      slice_index, gen, slice_indices_by_inst,
+                      crossing_counts, crossing_instructions);
                 break;
               }
             case SET_EFFECTS:
               {
-                event_to_check = &inst->as_set_effects()->rhs;
+                parallelize_replay_event(inst->as_set_effects()->rhs,
+                    slice_index, gen, slice_indices_by_inst,
+                    crossing_counts, crossing_instructions);
                 break;
               }
             case COMPLETE_REPLAY:
               {
-                event_to_check = &inst->as_complete_replay()->rhs;
-                break;
-              }
-            case ACQUIRE_REPLAY:
-              {
-                event_to_check = &inst->as_acquire_replay()->rhs;
-                break;
-              }
-            case RELEASE_REPLAY:
-              {
-                event_to_check = &inst->as_release_replay()->rhs;
+                parallelize_replay_event(inst->as_complete_replay()->rhs,
+                    slice_index, gen, slice_indices_by_inst,
+                    crossing_counts, crossing_instructions);
                 break;
               }
             default:
               {
                 break;
               }
-          }
-          if (event_to_check != NULL)
-          {
-            unsigned ev = *event_to_check;
-            unsigned g = gen[ev];
-#ifdef DEBUG_LEGION
-            assert(g != -1U && g < instructions.size());
-#endif
-            unsigned generator_slice = slice_indices_by_inst[g];
-#ifdef DEBUG_LEGION
-            assert(generator_slice != -1U);
-#endif
-            if (generator_slice != slice_index)
-            {
-              std::map<unsigned, std::pair<unsigned,unsigned> >::iterator
-                finder = crossing_counts.find(ev);
-              if (finder != crossing_counts.end())
-              {
-                *event_to_check = finder->second.first;
-                finder->second.second += 1;
-              }
-              else
-              {
-                unsigned new_crossing_event = events.size();
-                events.resize(events.size() + 1);
-                crossing_counts[ev] =
-                  std::pair<unsigned,unsigned>(new_crossing_event, 1/*count*/);
-                *event_to_check = new_crossing_event;
-                TriggerEvent *crossing = new TriggerEvent(*this,
-                    new_crossing_event, ev, instructions[g]->owner); 
-                slices[generator_slice].push_back(crossing);
-                crossing_instructions.push_back(crossing);
-              }
-            }
           }
         }
       }
@@ -4854,6 +4892,46 @@ namespace Legion {
       if (!crossing_instructions.empty())
         instructions.insert(instructions.end(),
             crossing_instructions.begin(), crossing_instructions.end());
+    }
+
+    //--------------------------------------------------------------------------
+    void PhysicalTemplate::parallelize_replay_event(unsigned &event_to_check,
+              unsigned slice_index, const std::vector<unsigned> &gen,
+              const std::vector<unsigned> &slice_indices_by_inst,
+              std::map<unsigned,std::pair<unsigned,unsigned> > &crossing_counts,
+              std::vector<Instruction*> &crossing_instructions)
+    //--------------------------------------------------------------------------
+    {
+      unsigned g = gen[event_to_check];
+#ifdef DEBUG_LEGION
+      assert(g != -1U && g < instructions.size());
+#endif
+      unsigned generator_slice = slice_indices_by_inst[g];
+#ifdef DEBUG_LEGION
+      assert(generator_slice != -1U);
+#endif
+      if (generator_slice != slice_index)
+      {
+        std::map<unsigned, std::pair<unsigned,unsigned> >::iterator
+          finder = crossing_counts.find(event_to_check);
+        if (finder != crossing_counts.end())
+        {
+          event_to_check = finder->second.first;
+          finder->second.second += 1;
+        }
+        else
+        {
+          unsigned new_crossing_event = events.size();
+          events.resize(events.size() + 1);
+          crossing_counts[event_to_check] =
+            std::pair<unsigned,unsigned>(new_crossing_event, 1/*count*/);
+          TriggerEvent *crossing = new TriggerEvent(*this,
+              new_crossing_event, event_to_check, instructions[g]->owner); 
+          event_to_check = new_crossing_event;
+          slices[generator_slice].push_back(crossing);
+          crossing_instructions.push_back(crossing);
+        }
+      }
     }
 
     //--------------------------------------------------------------------------
@@ -4936,20 +5014,39 @@ namespace Legion {
               outgoing[copy->precondition_idx].push_back(copy->lhs);
               break;
             }
-          case ISSUE_INDIRECT :
-            {
-              // See elide_fences for comment about why we use
-              // tracing_pre_idx here instead of precondition_idx
-              IssueIndirect *indirect = inst->as_issue_indirect();
-              incoming[indirect->lhs].push_back(indirect->tracing_pre_idx);
-              outgoing[indirect->tracing_pre_idx].push_back(indirect->lhs);
-              break;
-            }
           case ISSUE_FILL :
             {
               IssueFill *fill = inst->as_issue_fill();
               incoming[fill->lhs].push_back(fill->precondition_idx);
               outgoing[fill->precondition_idx].push_back(fill->lhs);
+              break;
+            }
+          case ISSUE_ACROSS:
+            {
+              IssueAcross *across = inst->as_issue_across();
+              incoming[across->lhs].push_back(across->copy_precondition);
+              outgoing[across->copy_precondition].push_back(across->lhs);
+              if (across->collective_precondition != 0)
+              {
+                incoming[across->lhs].push_back(
+                    across->collective_precondition);
+                outgoing[across->collective_precondition].push_back(
+                    across->lhs);
+              }
+              if (across->src_indirect_precondition != 0)
+              {
+                incoming[across->lhs].push_back(
+                    across->src_indirect_precondition);
+                outgoing[across->src_indirect_precondition].push_back(
+                    across->lhs);
+              }
+              if (across->dst_indirect_precondition != 0)
+              {
+                incoming[across->lhs].push_back(
+                    across->dst_indirect_precondition);
+                outgoing[across->dst_indirect_precondition].push_back(
+                    across->lhs);
+              }
               break;
             }
           case SET_OP_SYNC_EVENT :
@@ -4989,17 +5086,6 @@ namespace Legion {
 #endif
               incoming[lhs].push_back(replay->rhs);
               outgoing[replay->rhs].push_back(lhs);
-              break;
-            }
-          case ACQUIRE_REPLAY:
-            {
-              AcquireReplay *acquire = inst->as_acquire_replay();
-              incoming[acquire->lhs].push_back(acquire->rhs);
-              outgoing[acquire->rhs].push_back(acquire->lhs);
-              break;
-            }
-          case RELEASE_REPLAY:
-            {
               break;
             }
           default:
@@ -5314,22 +5400,38 @@ namespace Legion {
               lhs = copy->lhs;
               break;
             }
-          case ISSUE_INDIRECT :
-            {
-              // See elide_fences for the comment describing why we use
-              // tracing_pre_idx here instead of precondition_idx
-              IssueIndirect *indirect = inst->as_issue_indirect();
-              int subst = substs[indirect->tracing_pre_idx];
-              if (subst >= 0) indirect->tracing_pre_idx = (unsigned)subst;
-              lhs = indirect->lhs;
-              break;
-            }
           case ISSUE_FILL:
             {
               IssueFill *fill = inst->as_issue_fill();
               int subst = substs[fill->precondition_idx];
               if (subst >= 0) fill->precondition_idx = (unsigned)subst;
               lhs = fill->lhs;
+              break;
+            }
+          case ISSUE_ACROSS:
+            {
+              IssueAcross *across = inst->as_issue_across();
+              int subst = substs[across->copy_precondition];
+              if (subst >= 0) across->copy_precondition= (unsigned)subst;
+              if (across->collective_precondition != 0)
+              {
+                int subst = substs[across->collective_precondition];
+                if (subst >= 0) 
+                  across->collective_precondition = (unsigned)subst;
+              }
+              if (across->src_indirect_precondition != 0)
+              {
+                int subst = substs[across->src_indirect_precondition];
+                if (subst >= 0) 
+                  across->src_indirect_precondition = (unsigned)subst;
+              }
+              if (across->dst_indirect_precondition != 0)
+              {
+                int subst = substs[across->dst_indirect_precondition];
+                if (subst >= 0) 
+                  across->dst_indirect_precondition = (unsigned)subst;
+              }
+              lhs = across->lhs;
               break;
             }
           case SET_EFFECTS:
@@ -5361,21 +5463,6 @@ namespace Legion {
               CompleteReplay *replay = inst->as_complete_replay();
               int subst = substs[replay->rhs];
               if (subst >= 0) replay->rhs = (unsigned)subst;
-              break;
-            }
-          case ACQUIRE_REPLAY:
-            {
-              AcquireReplay *acquire = inst->as_acquire_replay();
-              int subst = substs[acquire->rhs];
-              if (subst >= 0) acquire->rhs = (unsigned)subst;
-              lhs = acquire->lhs;
-              break;
-            }
-          case RELEASE_REPLAY:
-            {
-              ReleaseReplay *release = inst->as_release_replay();
-              int subst = substs[release->rhs];
-              if (subst >= 0) release->rhs = (unsigned)subst;
               break;
             }
           default:
@@ -5467,17 +5554,6 @@ namespace Legion {
               used[gen[copy->precondition_idx]] = true;
               break;
             }
-          case ISSUE_INDIRECT:
-            {
-              IssueIndirect *indirect = inst->as_issue_indirect();
-              // See elide_fences for the comment about why we use
-              // tracing_pre_idx instead of precondition_idx
-#ifdef DEBUG_LEGION
-              assert(gen[indirect->tracing_pre_idx] != -1U);
-#endif
-              used[gen[indirect->tracing_pre_idx]] = true;
-              break;
-            }
           case ISSUE_FILL:
             {
               IssueFill *fill = inst->as_issue_fill();
@@ -5485,6 +5561,36 @@ namespace Legion {
               assert(gen[fill->precondition_idx] != -1U);
 #endif
               used[gen[fill->precondition_idx]] = true;
+              break;
+            }
+          case ISSUE_ACROSS:
+            {
+              IssueAcross *across = inst->as_issue_across();
+#ifdef DEBUG_LEGION
+              assert(gen[across->copy_precondition] != -1U);
+#endif
+              used[gen[across->copy_precondition]] = true;
+              if (across->collective_precondition != 0)
+              {
+#ifdef DEBUG_LEGION
+                assert(gen[across->collective_precondition] != -1U);
+#endif
+                used[gen[across->collective_precondition]] = true;
+              }
+              if (across->src_indirect_precondition!= 0)
+              {
+#ifdef DEBUG_LEGION
+                assert(gen[across->src_indirect_precondition] != -1U);
+#endif
+                used[gen[across->src_indirect_precondition]] = true;
+              }
+              if (across->dst_indirect_precondition!= 0)
+              {
+#ifdef DEBUG_LEGION
+                assert(gen[across->dst_indirect_precondition] != -1U);
+#endif
+                used[gen[across->dst_indirect_precondition]] = true;
+              }
               break;
             }
           case SET_EFFECTS:
@@ -5503,24 +5609,6 @@ namespace Legion {
               assert(gen[complete->rhs] != -1U);
 #endif
               used[gen[complete->rhs]] = true;
-              break;
-            }
-          case ACQUIRE_REPLAY:
-            {
-              AcquireReplay *acquire = inst->as_acquire_replay();
- #ifdef DEBUG_LEGION
-              assert(gen[acquire->rhs] != -1U);
-#endif
-              used[gen[acquire->rhs]] = true;             
-              break;
-            }
-          case RELEASE_REPLAY:
-            {
-              ReleaseReplay *release = inst->as_release_replay();
- #ifdef DEBUG_LEGION
-              assert(gen[release->rhs] != -1U);
-#endif
-              used[gen[release->rhs]] = true;             
               break;
             }
           case BARRIER_ARRIVAL:
@@ -6032,43 +6120,6 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void PhysicalTemplate::record_issue_indirect(const TraceLocalID &tlid,
-                             ApEvent &lhs, IndexSpaceExpression *expr,
-                             const std::vector<CopySrcDstField>& src_fields,
-                             const std::vector<CopySrcDstField>& dst_fields,
-                             const std::vector<CopyIndirection*> &indirections,
-#ifdef LEGION_SPY
-                             unsigned unique_indirections_identifier,
-#endif
-                             ApEvent precondition, PredEvent pred_guard,
-                             ApEvent tracing_precondition)
-    //--------------------------------------------------------------------------
-    {
-      if (!lhs.exists())
-      {
-        Realm::UserEvent rename(Realm::UserEvent::create_user_event());
-        rename.trigger();
-        lhs = ApEvent(rename);
-      } 
-
-      AutoLock tpl_lock(template_lock);
-#ifdef DEBUG_LEGION
-      assert(is_recording());
-#endif
-      // Do this first in case it gets preempted
-      const unsigned rhs_ = find_event(precondition, tpl_lock);
-      const unsigned pre_ = find_event(tracing_precondition, tpl_lock);
-      unsigned lhs_ = convert_event(lhs);
-      insert_instruction(new IssueIndirect(
-            *this, lhs_, expr, tlid,
-            src_fields, dst_fields, indirections,
-#ifdef LEGION_SPY
-            unique_indirections_identifier,
-#endif
-            rhs_, pre_));
-    }
-
-    //--------------------------------------------------------------------------
     void PhysicalTemplate::record_issue_fill(const TraceLocalID &tlid, 
                                              ApEvent &lhs,
                                              IndexSpaceExpression *expr,
@@ -6104,6 +6155,42 @@ namespace Legion {
                                        fill_uid, handle, tree_id,
 #endif
                                        rhs_));
+    }
+
+    //--------------------------------------------------------------------------
+    void PhysicalTemplate::record_issue_across(const TraceLocalID &tlid, 
+                                              ApEvent &lhs,
+                                              ApEvent collective_precondition,
+                                              ApEvent copy_precondition,
+                                              ApEvent src_indirect_precondition,
+                                              ApEvent dst_indirect_precondition,
+                                              CopyAcrossExecutor *executor)
+    //--------------------------------------------------------------------------
+    {
+      if (!lhs.exists())
+      {
+        ApUserEvent rename = Runtime::create_ap_user_event(NULL);
+        Runtime::trigger_event(NULL, rename);
+        lhs = rename;
+      }
+
+      AutoLock tpl_lock(template_lock);
+#ifdef DEBUG_LEGION
+      assert(is_recording());
+#endif
+      unsigned copy_pre = find_event(copy_precondition, tpl_lock);
+      unsigned collective_pre = 0, src_indirect_pre = 0, dst_indirect_pre = 0;
+      if (collective_precondition.exists())
+        collective_pre = find_event(collective_precondition, tpl_lock);
+      if (src_indirect_precondition.exists())
+        src_indirect_pre = find_event(src_indirect_precondition, tpl_lock);
+      if (dst_indirect_precondition.exists())
+        dst_indirect_pre = find_event(dst_indirect_precondition, tpl_lock);
+      unsigned lhs_ = convert_event(lhs);
+      IssueAcross *across = new IssueAcross(*this, lhs_,copy_pre,collective_pre,
+       src_indirect_pre, dst_indirect_pre, tlid, executor);
+      across_copies.push_back(across);
+      insert_instruction(across);
     }
 
     //--------------------------------------------------------------------------
@@ -6143,15 +6230,18 @@ namespace Legion {
       const unsigned lhs_ = find_event(lhs, tpl_lock);
       record_views(lhs_, expr,RegionUsage(LEGION_WRITE_ONLY,LEGION_EXCLUSIVE,0), 
                    tracing_dsts, applied_events);
-      record_copy_views(lhs_, expr, tracing_dsts);
+      record_expression_views(copy_views[lhs_], expr, tracing_dsts);
     }
 
     //--------------------------------------------------------------------------
-    void PhysicalTemplate::record_copy_views(ApEvent lhs,
+    void PhysicalTemplate::record_copy_views(ApEvent lhs, 
+                                 const TraceLocalID &tlid,
+                                 unsigned src_idx, unsigned dst_idx,
                                  IndexSpaceExpression *expr,
                                  const FieldMaskSet<InstanceView> &tracing_srcs,
                                  const FieldMaskSet<InstanceView> &tracing_dsts,
                                  PrivilegeMode src_mode, PrivilegeMode dst_mode,
+                                 bool src_indirect, bool dst_indirect,
                                  std::set<RtEvent> &applied_events)
     //--------------------------------------------------------------------------
     {
@@ -6162,10 +6252,12 @@ namespace Legion {
       const unsigned lhs_ = find_event(lhs, tpl_lock);
       record_views(lhs_, expr, RegionUsage(src_mode, LEGION_EXCLUSIVE, 0),
                    tracing_srcs, applied_events);
-      record_copy_views(lhs_, expr, tracing_srcs);
+      record_expression_views(src_indirect ? 
+          src_indirect_views[lhs_] : copy_views[lhs_], expr, tracing_srcs);
       record_views(lhs_, expr,RegionUsage(dst_mode, LEGION_EXCLUSIVE, 0),
                    tracing_dsts, applied_events);
-      record_copy_views(lhs_, expr, tracing_dsts);
+      record_expression_views(dst_indirect ?
+          dst_indirect_views[lhs_] : copy_views[lhs_], expr, tracing_dsts);
     }
 
     //--------------------------------------------------------------------------
@@ -6188,7 +6280,7 @@ namespace Legion {
       // for their view user
       record_views(all, expr, RegionUsage(privilege,
             LEGION_EXCLUSIVE, 0), tracing_views, applied);
-      record_copy_views(indirect, expr, tracing_views);
+      record_expression_views(copy_views[indirect], expr, tracing_views);
     }
 
     //--------------------------------------------------------------------------
@@ -6272,12 +6364,11 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void PhysicalTemplate::record_copy_views(unsigned copy_id,
-                                             IndexSpaceExpression *expr,
+    /*static*/ void PhysicalTemplate::record_expression_views(ViewExprs &cviews,
+                                        IndexSpaceExpression *expr,
                                         const FieldMaskSet<InstanceView> &views)
     //--------------------------------------------------------------------------
     {
-      ViewExprs &cviews = copy_views[copy_id];
       for (FieldMaskSet<InstanceView>::const_iterator it = views.begin();
            it != views.end(); ++it)
         cviews[it->first].insert(expr, it->second);
@@ -6332,30 +6423,35 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void PhysicalTemplate::record_reservations(
-                                const TraceLocalID &tlid, ApEvent &lhs,
+    void PhysicalTemplate::record_reservations(const TraceLocalID &tlid,
                                 const std::map<Reservation,bool> &reservations,
-                                ApEvent precondition, ApEvent postcondition)
+                                std::set<RtEvent> &applied_events)
     //--------------------------------------------------------------------------
     {
       AutoLock tpl_lock(template_lock);
 #ifdef DEBUG_LEGION
       assert(is_recording());
+      assert(cached_reservations.find(tlid) == cached_reservations.end());
 #endif
-      // Do this first in case it gets pre-empted
-      const unsigned pre = find_event(precondition, tpl_lock);
-      const unsigned post = find_event(postcondition, tpl_lock);
+      cached_reservations[tlid] = reservations;
+    }
 
-      // Always produce a fresh output event here
-      {
-        const ApUserEvent rename = Runtime::create_ap_user_event(NULL);
-        Runtime::trigger_event(NULL, rename, lhs);
-        lhs = rename;
-      }
-      const unsigned lhs_ = convert_event(lhs);
-      insert_instruction(new AcquireReplay(*this, lhs_, pre,tlid,reservations));
-      events.push_back(ApEvent());
-      insert_instruction(new ReleaseReplay(*this, post, tlid, reservations));
+    //--------------------------------------------------------------------------
+    void PhysicalTemplate::get_task_reservations(SingleTask *task,
+                                 std::map<Reservation,bool> &reservations) const
+    //--------------------------------------------------------------------------
+    {
+      const TraceLocalID key = task->get_trace_local_id();
+      AutoLock t_lock(template_lock, 1, false/*exclusive*/);
+#ifdef DEBUG_LEGION
+      assert(is_replaying());
+#endif
+      std::map<TraceLocalID,std::map<Reservation,bool> >::const_iterator
+        finder = cached_reservations.find(key);
+#ifdef DEBUG_LEGION
+      assert(finder != cached_reservations.end());
+#endif
+      reservations = finder->second;
     }
 
     //--------------------------------------------------------------------------
@@ -6462,15 +6558,20 @@ namespace Legion {
         if (runtime->dump_physical_traces)
           dump_template();
       }
-      fence_completion = completion;
       if (recurrent)
+      {
+        fence_completion = ApEvent::NO_AP_EVENT;
         for (std::map<unsigned, unsigned>::iterator it = frontiers.begin();
             it != frontiers.end(); ++it)
           events[it->second] = events[it->first];
+      }
       else
+      {
+        fence_completion = completion;
         for (std::map<unsigned, unsigned>::iterator it = frontiers.begin();
             it != frontiers.end(); ++it)
           events[it->second] = completion;
+      }
 
       events[fence_completion_id] = fence_completion;
 
@@ -6486,7 +6587,7 @@ namespace Legion {
         trace->get_replay_targets();
       for (unsigned idx = 0; idx < replay_parallelism; ++idx)
       {
-        ReplaySliceArgs args(this, idx);
+        ReplaySliceArgs args(this, idx, recurrent);
         const RtEvent done = runtime->replay_on_cpus ?
           runtime->issue_application_processor_task(args, LG_LOW_PRIORITY,
             replay_targets[idx % replay_targets.size()], replay_precondition) :
@@ -6549,7 +6650,7 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       const ReplaySliceArgs *pargs = (const ReplaySliceArgs*)args;
-      pargs->tpl->execute_slice(pargs->slice_index);
+      pargs->tpl->execute_slice(pargs->slice_index, pargs->recurrent_replay);
     }
 
     //--------------------------------------------------------------------------
@@ -6715,6 +6816,48 @@ namespace Legion {
         }
     }
 
+    //--------------------------------------------------------------------------
+    bool PhysicalTemplate::are_read_only_users(ViewExprs &view_exprs)
+    //--------------------------------------------------------------------------
+    {
+      RegionTreeForest *forest = trace->runtime->forest;
+      for (ViewExprs::const_iterator vit = 
+            view_exprs.begin(); vit != view_exprs.end(); vit++)
+      {
+        ViewUsers::const_iterator finder = view_users.find(vit->first);
+#ifdef DEBUG_LEGION
+        assert(finder != view_users.end());
+#endif
+        for (FieldMaskSet<ViewUser>::const_iterator uit =
+              finder->second.begin(); uit != finder->second.end(); uit++)
+        {
+          // If the user is read-only then we don't care
+          if (IS_READ_ONLY(uit->first->usage))
+            continue;
+          // If there are no overlapping fields then there is nothing
+          // to care about
+          if (uit->second * vit->second.get_valid_mask())
+            continue;
+          // Now check all the expressions and see if they are independent
+          for (FieldMaskSet<IndexSpaceExpression>::const_iterator it =
+                vit->second.begin(); it != vit->second.end(); it++)
+          {
+            // If there are no overlapping fields then we are good
+            if (uit->second * it->second)
+              continue;
+            // Last chance: check to see if the expressions are independent
+            IndexSpaceExpression *intersect = 
+              forest->intersect_index_spaces(uit->first->expr, it->first);
+            if (intersect->is_empty())
+              continue;
+            // Not immutable
+            return false;
+          }
+        }
+      }
+      return true;
+    }
+
     /////////////////////////////////////////////////////////////
     // ShardedPhysicalTemplate
     /////////////////////////////////////////////////////////////
@@ -6732,18 +6875,6 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       repl_ctx->add_reference();
-    }
-
-    //--------------------------------------------------------------------------
-    ShardedPhysicalTemplate::ShardedPhysicalTemplate(
-                                             const ShardedPhysicalTemplate &rhs)
-      : PhysicalTemplate(rhs), repl_ctx(rhs.repl_ctx), 
-        local_shard(rhs.local_shard), total_shards(rhs.total_shards), 
-        template_index(rhs.template_index)
-    //--------------------------------------------------------------------------
-    {
-      // should never be called
-      assert(false);
     }
 
     //--------------------------------------------------------------------------
@@ -7076,42 +7207,7 @@ namespace Legion {
                                           src_tree_id, dst_tree_id,
 #endif
                                           precondition, pred_guard); 
-    }
-
-    //--------------------------------------------------------------------------
-    void ShardedPhysicalTemplate::record_issue_indirect(
-                             const TraceLocalID &tlid, ApEvent &lhs,
-                             IndexSpaceExpression *expr,
-                             const std::vector<CopySrcDstField>& src_fields,
-                             const std::vector<CopySrcDstField>& dst_fields,
-                             const std::vector<CopyIndirection*> &indirections,
-#ifdef LEGION_SPY
-                             unsigned unique_indirections_identifier,
-#endif
-                             ApEvent precondition, PredEvent pred_guard,
-                             ApEvent tracing_precondition)
-    //--------------------------------------------------------------------------
-    {
-      // Make sure the lhs event is local to our shard
-      if (lhs.exists())
-      {
-        const AddressSpaceID event_space = find_event_space(lhs);
-        if (event_space != repl_ctx->runtime->address_space)
-        {
-          ApUserEvent rename = Runtime::create_ap_user_event(NULL);
-          Runtime::trigger_event(NULL, rename, lhs);
-          lhs = rename;
-        }
-      }
-      // Then do the base call
-      PhysicalTemplate::record_issue_indirect(tlid, lhs, expr, src_fields,
-                                              dst_fields, indirections,
-#ifdef LEGION_SPY
-                                              unique_indirections_identifier,
-#endif
-                                              precondition, pred_guard,
-                                              tracing_precondition);
-    }
+    } 
     
     //--------------------------------------------------------------------------
     void ShardedPhysicalTemplate::record_issue_fill(const TraceLocalID &tlid,
@@ -7143,6 +7239,35 @@ namespace Legion {
                                           fill_uid, handle, tree_id,
 #endif
                                           precondition, pred_guard);
+    }
+
+    //--------------------------------------------------------------------------
+    void ShardedPhysicalTemplate::record_issue_across(const TraceLocalID &tlid, 
+                                             ApEvent &lhs,
+                                             ApEvent collective_precondition,
+                                             ApEvent copy_precondition,
+                                             ApEvent src_indirect_precondition,
+                                             ApEvent dst_indirect_precondition,
+                                             CopyAcrossExecutor *executor)
+    //--------------------------------------------------------------------------
+    {
+      // Make sure the lhs event is local to our shard
+      if (lhs.exists())
+      {
+        const AddressSpaceID event_space = find_event_space(lhs);
+        if (event_space != repl_ctx->runtime->address_space)
+        {
+          ApUserEvent rename = Runtime::create_ap_user_event(NULL);
+          Runtime::trigger_event(NULL, rename, lhs);
+          lhs = rename;
+        }
+      }
+      // Then do the base call
+      PhysicalTemplate::record_issue_across(tlid, lhs, collective_precondition,
+                                            copy_precondition,
+                                            src_indirect_precondition,
+                                            dst_indirect_precondition,
+                                            executor);
     }
 
     //--------------------------------------------------------------------------
@@ -7275,13 +7400,12 @@ namespace Legion {
             IndexSpaceExpression *user_expr = 
               IndexSpaceExpression::unpack_expression(derez, runtime->forest, 
                                     source, pending, expr_ready);
-            if ((view_ready.exists() && !view_ready.has_triggered()) ||
-                (expr_ready.exists() && !expr_ready.has_triggered()))
+            if (view_ready.exists() || expr_ready.exists())
             {
               if (user_expr != NULL)
               {
 #ifdef DEBUG_LEGION
-                assert(!expr_ready.exists() || expr_ready.has_triggered());
+                assert(!expr_ready.exists());
 #endif
                 DeferTraceUpdateArgs args(this, kind,done,view,derez,user_expr);
                 runtime->issue_runtime_meta_task(args, 
@@ -7331,13 +7455,12 @@ namespace Legion {
             IndexSpaceExpression *user_expr = 
               IndexSpaceExpression::unpack_expression(derez, runtime->forest, 
                                                 source, pending, expr_ready); 
-            if ((view_ready.exists() && !view_ready.has_triggered()) ||
-                (expr_ready.exists() && !expr_ready.has_triggered()))
+            if (view_ready.exists() || expr_ready.exists())
             {
               if (user_expr != NULL)
               {
 #ifdef DEBUG_LEGION
-                assert(!expr_ready.exists() || expr_ready.has_triggered());
+                assert(!expr_ready.exists());
 #endif
                 DeferTraceUpdateArgs args(this, kind,done,view,derez,user_expr);
                 runtime->issue_runtime_meta_task(args, 
@@ -7486,6 +7609,75 @@ namespace Legion {
               }
             }
             derez.deserialize(done);
+            break;
+          }
+        case READ_ONLY_USERS_REQUEST:
+          {
+            ShardID source_shard;
+            derez.deserialize(source_shard);
+#ifdef DEBUG_LEGION
+            assert(source_shard != repl_ctx->owner_shard->shard_id);
+#endif
+            ViewExprs view_exprs;
+            size_t num_views;
+            derez.deserialize(num_views);
+            std::vector<RtEvent> ready_events;
+            RegionTreeForest *forest = trace->runtime->forest;
+            for (unsigned vidx = 0; vidx < num_views; vidx++)
+            {
+              DistributedID view_did;
+              derez.deserialize(view_did);
+              RtEvent view_ready;
+              InstanceView *view = static_cast<InstanceView*>(
+                runtime->find_or_request_logical_view(view_did, view_ready));
+              if (view_ready.exists())
+                ready_events.push_back(view_ready);
+              FieldMaskSet<IndexSpaceExpression> &exprs = view_exprs[view];
+              size_t num_exprs;
+              derez.deserialize(num_exprs);
+              for (unsigned idx = 0; idx < num_exprs; idx++)
+              {
+                IndexSpaceExpression *expr = 
+                 IndexSpaceExpression::unpack_expression(derez, forest, source);
+                FieldMask mask;
+                derez.deserialize(mask);
+                exprs.insert(expr, mask);
+              }
+            }
+            std::atomic<bool> *result;
+            derez.deserialize(result);
+            derez.deserialize(done);
+            ShardManager *manager = repl_ctx->shard_manager;
+            if (!ready_events.empty())
+            {
+              const RtEvent wait_on = Runtime::merge_events(ready_events);
+              if (wait_on.exists() && !wait_on.has_triggered())
+                wait_on.wait();
+            }
+            if (!PhysicalTemplate::are_read_only_users(view_exprs))
+            {
+              Serializer rez;
+              rez.serialize(manager->repl_id);
+              rez.serialize(source_shard);
+              rez.serialize(template_index);
+              rez.serialize(READ_ONLY_USERS_RESPONSE);
+              rez.serialize(result);
+              rez.serialize(done);
+              manager->send_trace_update(source_shard, rez);
+              // Make sure we don't double trigger
+              done = RtUserEvent::NO_RT_USER_EVENT;
+            }
+            // Otherwise we can just fall through and trigger the event
+            break;
+          }
+        case READ_ONLY_USERS_RESPONSE:
+          {
+            std::atomic<bool> *result;
+            derez.deserialize(result);
+            result->store(false);
+            RtUserEvent done;
+            derez.deserialize(done);
+            Runtime::trigger_event(done);
             break;
           }
         case TEMPLATE_BARRIER_REFRESH:
@@ -8662,6 +8854,69 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    bool ShardedPhysicalTemplate::are_read_only_users(ViewExprs &view_exprs)
+    //--------------------------------------------------------------------------
+    {
+      std::map<ShardID,ViewExprs> shard_view_exprs;
+      for (ViewExprs::iterator vit = 
+            view_exprs.begin(); vit != view_exprs.end(); vit++)
+      {
+        const ShardID owner_shard = find_view_owner(vit->first); 
+        shard_view_exprs[owner_shard][vit->first].swap(vit->second);
+      }
+      std::atomic<bool> result(true);
+      std::vector<RtEvent> done_events;
+      ShardManager *manager = repl_ctx->shard_manager;
+      const ShardID local_shard = repl_ctx->owner_shard->shard_id;
+      for (std::map<ShardID,ViewExprs>::iterator sit = 
+            shard_view_exprs.begin(); sit != shard_view_exprs.end(); sit++)
+      {
+        if (sit->first != local_shard)
+        {
+          const RtUserEvent done = Runtime::create_rt_user_event();
+          const AddressSpaceID target = manager->get_shard_space(sit->first);
+          Serializer rez;
+          rez.serialize(manager->repl_id);
+          rez.serialize(sit->first);
+          rez.serialize(template_index);
+          rez.serialize(READ_ONLY_USERS_REQUEST);
+          rez.serialize(local_shard);
+          rez.serialize<size_t>(sit->second.size());
+          for (ViewExprs::const_iterator vit = 
+                sit->second.begin(); vit != sit->second.end(); vit++)
+          {
+            rez.serialize(vit->first->did);
+            rez.serialize<size_t>(vit->second.size());
+            for (FieldMaskSet<IndexSpaceExpression>::const_iterator it =
+                  vit->second.begin(); it != vit->second.end(); it++)
+            {
+              it->first->pack_expression(rez, target);
+              rez.serialize(it->second);
+            }
+          }
+          rez.serialize(&result);
+          rez.serialize(done);
+          manager->send_trace_update(sit->first, rez);
+          done_events.push_back(done);
+        }
+        else if (!PhysicalTemplate::are_read_only_users(sit->second))
+        {
+          // Still need to wait for anyone else to write to result if 
+          // they end up finding out that they are not read-only
+          result.store(false);
+          break;
+        }
+      }
+      if (!done_events.empty())
+      {
+        const RtEvent wait_on = Runtime::merge_events(done_events);
+        if (wait_on.exists() && !wait_on.has_triggered())
+          wait_on.wait();
+      }
+      return result.load();
+    }
+
+    //--------------------------------------------------------------------------
     void ShardedPhysicalTemplate::find_last_users_sharded(InstanceView *view,
                                                   IndexSpaceExpression *expr,
                                                   const FieldMask &mask,
@@ -8770,7 +9025,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void GetTermEvent::execute(std::vector<ApEvent> &events,
                                std::map<unsigned,ApUserEvent> &user_events,
-                               std::map<TraceLocalID,Memoizable*> &operations)
+                               std::map<TraceLocalID,Memoizable*> &operations,
+                               const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -8816,7 +9072,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void CreateApUserEvent::execute(std::vector<ApEvent> &events,
                                  std::map<unsigned,ApUserEvent> &user_events,
-                                 std::map<TraceLocalID,Memoizable*> &operations)
+                                 std::map<TraceLocalID,Memoizable*> &operations,
+                                 const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
       ApUserEvent ev = Runtime::create_ap_user_event(NULL);
@@ -8853,7 +9110,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void TriggerEvent::execute(std::vector<ApEvent> &events,
                                std::map<unsigned,ApUserEvent> &user_events,
-                               std::map<TraceLocalID,Memoizable*> &operations)
+                               std::map<TraceLocalID,Memoizable*> &operations,
+                               const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -8896,7 +9154,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void MergeEvent::execute(std::vector<ApEvent> &events,
                              std::map<unsigned,ApUserEvent> &user_events,
-                             std::map<TraceLocalID,Memoizable*> &operations)
+                             std::map<TraceLocalID,Memoizable*> &operations,
+                             const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
       std::vector<ApEvent> to_merge;
@@ -8948,7 +9207,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void AssignFenceCompletion::execute(std::vector<ApEvent> &events,
                                  std::map<unsigned,ApUserEvent> &user_events,
-                                 std::map<TraceLocalID,Memoizable*> &operations)
+                                 std::map<TraceLocalID,Memoizable*> &operations,
+                                 const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
       events[lhs] = tpl.get_fence_completion();
@@ -8974,13 +9234,13 @@ namespace Legion {
                          const TraceLocalID& key,
                          const std::vector<CopySrcDstField>& s,
                          const std::vector<CopySrcDstField>& d,
-                         const std::vector<Reservation>& rs,
+                         const std::vector<Reservation>& r,
 #ifdef LEGION_SPY
                          RegionTreeID src_tid, RegionTreeID dst_tid,
 #endif
                          unsigned pi)
       : Instruction(tpl, key), lhs(l), expr(e), src_fields(s), dst_fields(d), 
-        reservations(rs),
+        reservations(r),
 #ifdef LEGION_SPY
         src_tree_id(src_tid), dst_tree_id(dst_tid),
 #endif
@@ -9008,7 +9268,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void IssueCopy::execute(std::vector<ApEvent> &events,
                             std::map<unsigned,ApUserEvent> &user_events,
-                            std::map<TraceLocalID,Memoizable*> &operations)
+                            std::map<TraceLocalID,Memoizable*> &operations,
+                            const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -9060,54 +9321,39 @@ namespace Legion {
     }
 
     /////////////////////////////////////////////////////////////
-    // IssueIndirect
+    // IssueAcross
     /////////////////////////////////////////////////////////////
 
     //--------------------------------------------------------------------------
-    IssueIndirect::IssueIndirect(PhysicalTemplate& tpl,
-                                 unsigned l, IndexSpaceExpression *e,
-                                 const TraceLocalID& key,
-                                 const std::vector<CopySrcDstField>& s,
-                                 const std::vector<CopySrcDstField>& d,
-                                 const std::vector<CopyIndirection*> &indirects,
-#ifdef LEGION_SPY
-                                 unsigned unique_indirections_id,
-#endif
-                                 unsigned pi, unsigned pre_idx)
-      : Instruction(tpl, key), lhs(l), expr(e), src_fields(s), dst_fields(d), 
-#ifdef LEGION_SPY
-        unique_indirections_identifier(unique_indirections_id), 
-#endif
-        precondition_idx(pi), tracing_pre_idx(pre_idx)
+    IssueAcross::IssueAcross(PhysicalTemplate& tpl, unsigned l, unsigned copy,
+                             unsigned collective, unsigned src_indirect,
+                             unsigned dst_indirect, const TraceLocalID& key,
+                             CopyAcrossExecutor *exec)
+      : Instruction(tpl, key), lhs(l), copy_precondition(copy), 
+        collective_precondition(collective), 
+        src_indirect_precondition(src_indirect),
+        dst_indirect_precondition(dst_indirect), executor(exec)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
       assert(lhs < tpl.events.size());
-      assert(src_fields.size() > 0);
-      assert(dst_fields.size() > 0);
-      assert(precondition_idx < tpl.events.size());
-      assert(expr != NULL);
 #endif
-      expr->add_base_expression_reference(TRACE_REF);
-      indirections.resize(indirects.size());
-      for (unsigned idx = 0; idx < indirects.size(); idx++)
-        indirections[idx] = indirects[idx]->clone();
+      executor->add_reference();
     }
 
     //--------------------------------------------------------------------------
-    IssueIndirect::~IssueIndirect(void)
+    IssueAcross::~IssueAcross(void)
     //--------------------------------------------------------------------------
     {
-      if (expr->remove_base_expression_reference(TRACE_REF))
-        delete expr;
-      for (unsigned idx = 0; idx < indirections.size(); idx++)
-        delete indirections[idx];
+      if (executor->remove_reference())
+        delete executor;
     }
 
     //--------------------------------------------------------------------------
-    void IssueIndirect::execute(std::vector<ApEvent> &events,
-                                std::map<unsigned,ApUserEvent> &user_events,
-                                std::map<TraceLocalID,Memoizable*> &operations)
+    void IssueAcross::execute(std::vector<ApEvent> &events,
+                              std::map<unsigned,ApUserEvent> &user_events,
+                              std::map<TraceLocalID,Memoizable*> &operations,
+                              const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -9116,48 +9362,29 @@ namespace Legion {
 #endif
       Memoizable *memo = operations[owner];
       Operation *op = memo->get_operation();
-      ApEvent precondition = events[precondition_idx];
+      ApEvent copy_pre = events[copy_precondition];
+      ApEvent src_indirect_pre = events[src_indirect_precondition];
+      ApEvent dst_indirect_pre = events[dst_indirect_precondition];
       const PhysicalTraceInfo trace_info(op, -1U, false);
-      events[lhs] = expr->issue_indirect(op, trace_info, dst_fields,
-                                         src_fields, indirections,
-#ifdef LEGION_SPY
-                                         unique_indirections_identifier,
-#endif
-                                         precondition,
-                                         PredEvent::NO_PRED_EVENT,
-                                         ApEvent::NO_AP_EVENT);
+      events[lhs] = executor->execute(op, PredEvent::NO_PRED_EVENT,
+                                      copy_pre, src_indirect_pre,
+                                      dst_indirect_pre, trace_info,
+                                      recurrent_replay);
     }
 
     //--------------------------------------------------------------------------
-    std::string IssueIndirect::to_string(const MemoEntries &memo_entries)
+    std::string IssueAcross::to_string(const MemoEntries &memo_entires)
     //--------------------------------------------------------------------------
     {
       std::stringstream ss;
       ss << "events[" << lhs << "] = indirect(operations[" << owner << "], "
-         << "Index expr: " << expr->expr_id << ", {";
-      for (unsigned idx = 0; idx < src_fields.size(); ++idx)
-      {
-        ss << "(" << std::hex << src_fields[idx].inst.id
-           << "," << std::dec << src_fields[idx].subfield_offset
-           << "," << src_fields[idx].size
-           << "," << src_fields[idx].field_id
-           << "," << src_fields[idx].serdez_id << ")";
-        if (idx != src_fields.size() - 1) ss << ",";
-      }
-      ss << "}, {";
-      for (unsigned idx = 0; idx < dst_fields.size(); ++idx)
-      {
-        ss << "(" << std::hex << dst_fields[idx].inst.id
-           << "," << std::dec << dst_fields[idx].subfield_offset
-           << "," << dst_fields[idx].size
-           << "," << dst_fields[idx].field_id
-           << "," << dst_fields[idx].serdez_id << ")";
-        if (idx != dst_fields.size() - 1) ss << ",";
-      }
-      ss << "}, events[" << precondition_idx << "]";
+         << "Copy Across Executor: " << executor << ", {";
       ss << ", TODO: indirections";
+      ss << "}, events[" << copy_precondition << "]";
+      ss << ", events[" << collective_precondition << "]";
+      ss << ", events[" << src_indirect_precondition << "]";
+      ss << ", events[" << dst_indirect_precondition << "]";
       ss << ")";
-
       return ss.str();
     }
 
@@ -9203,7 +9430,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void IssueFill::execute(std::vector<ApEvent> &events,
                             std::map<unsigned,ApUserEvent> &user_events,
-                            std::map<TraceLocalID,Memoizable*> &operations)
+                            std::map<TraceLocalID,Memoizable*> &operations,
+                            const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -9261,7 +9489,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void SetOpSyncEvent::execute(std::vector<ApEvent> &events,
                                  std::map<unsigned,ApUserEvent> &user_events,
-                                 std::map<TraceLocalID,Memoizable*> &operations)
+                                 std::map<TraceLocalID,Memoizable*> &operations,
+                                 const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -9310,7 +9539,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void SetEffects::execute(std::vector<ApEvent> &events,
                              std::map<unsigned,ApUserEvent> &user_events,
-                             std::map<TraceLocalID,Memoizable*> &operations)
+                             std::map<TraceLocalID,Memoizable*> &operations,
+                             const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -9358,7 +9588,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void CompleteReplay::execute(std::vector<ApEvent> &events,
                                  std::map<unsigned,ApUserEvent> &user_events,
-                                 std::map<TraceLocalID,Memoizable*> &operations)
+                                 std::map<TraceLocalID,Memoizable*> &operations,
+                                 const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -9383,92 +9614,6 @@ namespace Legion {
 #endif
       ss << "operations[" << owner
          << "].complete_replay(events[" << rhs << "])    (op kind: "
-         << Operation::op_names[finder->second.second]
-         << ")";
-      return ss.str();
-    }
-
-    /////////////////////////////////////////////////////////////
-    // AcquireReplay
-    /////////////////////////////////////////////////////////////
-
-    //--------------------------------------------------------------------------
-    AcquireReplay::AcquireReplay(PhysicalTemplate &tpl, unsigned lhs_,
-                         unsigned rhs_, const TraceLocalID &tld,
-                         const std::map<Reservation,bool> &reservations_)
-      : Instruction(tpl, tld), reservations(reservations_), 
-        lhs(lhs_), rhs(rhs_)
-    //--------------------------------------------------------------------------
-    {
-#ifdef DEBUG_LEGION
-      assert(lhs < tpl.events.size());
-      assert(rhs < tpl.events.size());
-#endif
-    }
-
-    //--------------------------------------------------------------------------
-    void AcquireReplay::execute(std::vector<ApEvent> &events,
-                                std::map<unsigned,ApUserEvent> &user_events,
-                                std::map<TraceLocalID,Memoizable*> &operations)
-      //--------------------------------------------------------------------------
-    {
-      ApEvent precondition = events[rhs];
-      for (std::map<Reservation,bool>::const_iterator it = 
-            reservations.begin(); it != reservations.end(); it++)
-        precondition = 
-          Runtime::acquire_ap_reservation(it->first, it->second, precondition);
-      events[lhs] = precondition;
-    }
-
-    //--------------------------------------------------------------------------
-    std::string AcquireReplay::to_string(const MemoEntries &memo_entries)
-    //--------------------------------------------------------------------------
-    {
-      std::stringstream ss;
-      ss << "events[" << lhs << "] = acquire_reservations(events[" << rhs
-         << "])   (owner: " << owner << ")"; 
-      return ss.str();
-    }
-
-    /////////////////////////////////////////////////////////////
-    // ReleaseReplay
-    /////////////////////////////////////////////////////////////
-
-    //--------------------------------------------------------------------------
-    ReleaseReplay::ReleaseReplay(PhysicalTemplate &tpl,
-                         unsigned rhs_, const TraceLocalID &tld,
-                         const std::map<Reservation,bool> &reservations_)
-      : Instruction(tpl, tld), reservations(reservations_), rhs(rhs_)
-    //--------------------------------------------------------------------------
-    {
-#ifdef DEBUG_LEGION
-      assert(rhs < tpl.events.size());
-#endif
-    }
-
-    //--------------------------------------------------------------------------
-    void ReleaseReplay::execute(std::vector<ApEvent> &events,
-                                std::map<unsigned,ApUserEvent> &user_events,
-                                std::map<TraceLocalID,Memoizable*> &operations)
-    //--------------------------------------------------------------------------
-    {
-      const ApEvent precondition = events[rhs];
-      for (std::map<Reservation,bool>::const_iterator it = 
-            reservations.begin(); it != reservations.end(); it++)
-        Runtime::release_reservation(it->first, precondition);
-    }
-
-    //--------------------------------------------------------------------------
-    std::string ReleaseReplay::to_string(const MemoEntries &memo_entries)
-    //--------------------------------------------------------------------------
-    {
-      std::stringstream ss;
-      MemoEntries::const_iterator finder = memo_entries.find(owner);
-#ifdef DEBUG_LEGION
-      assert(finder != memo_entries.end());
-#endif
-      ss << "operations[" << owner << "].release_reservations(events["
-         << rhs << "])   (op kind: "
          << Operation::op_names[finder->second.second]
          << ")";
       return ss.str();
@@ -9504,7 +9649,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void BarrierArrival::execute(std::vector<ApEvent> &events,
                                  std::map<unsigned,ApUserEvent> &user_events,
-                                 std::map<TraceLocalID,Memoizable*> &operations)
+                                 std::map<TraceLocalID,Memoizable*> &operations,
+                                 const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -9595,7 +9741,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void BarrierAdvance::execute(std::vector<ApEvent> &events,
                                  std::map<unsigned,ApUserEvent> &user_events,
-                                 std::map<TraceLocalID,Memoizable*> &operations)
+                                 std::map<TraceLocalID,Memoizable*> &operations,
+                                 const bool recurrent_replay)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION

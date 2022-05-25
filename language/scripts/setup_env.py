@@ -19,12 +19,8 @@ from __future__ import print_function
 import argparse, hashlib, multiprocessing, os, platform, re, subprocess, sys, tempfile, traceback
 
 def discover_llvm_version():
-    if os.environ.get('LMOD_SYSTEM_NAME') == 'summit': # Summit doesn't set hostname
-        return '60'
-    elif os.environ.get('NERSC_HOST') == 'perlmutter':
-        return '110'
-    else:
-        return '60'
+    # standardize on LLVM 13.0 everywhere
+    return '130'
 
 def discover_skip_certificate_check():
     if platform.node().startswith('titan'):
@@ -45,10 +41,17 @@ def discover_conduit():
         return 'psm'
     elif os.environ.get('LMOD_SYSTEM_NAME') == 'summit': # Summit doesn't set hostname
         return 'ibv'
+    elif os.environ.get('LMOD_SYSTEM_NAME') == 'crusher': # Crusher doesn't set hostname
+        return 'ofi-slingshot11'
     elif os.environ.get('NERSC_HOST') == 'perlmutter':
-        return 'ucx'
+        return 'ofi-slingshot10'
     else:
         raise Exception('Please set CONDUIT in your environment')
+
+def short_conduit(conduit):
+    if conduit is not None and conduit.startswith('ofi-'):
+        return 'ofi'
+    return conduit
 
 def gasnet_enabled():
     if 'USE_GASNET' in os.environ:
@@ -121,6 +124,7 @@ def build_llvm(source_dir, build_dir, install_dir, is_project_build, use_cmake, 
              '-DCMAKE_BUILD_TYPE=Release',
              '-DLLVM_ENABLE_ASSERTIONS=OFF',
              '-DLLVM_ENABLE_ZLIB=OFF',
+             '-DLLVM_ENABLE_LIBXML2=OFF',
              '-DLLVM_ENABLE_TERMINFO=OFF',
              '-DLLVM_ENABLE_LIBEDIT=OFF'] +
             extra_flags +
@@ -203,6 +207,8 @@ def build_hdf(source_dir, install_dir, thread_count, is_cray):
 
 def build_regent(root_dir, use_cmake, cmake_exe, extra_flags,
                  gasnet_dir, llvm_dir, terra_dir, hdf_dir, conduit, thread_count):
+    conduit = short_conduit(conduit)
+
     env = dict(list(os.environ.items()) +
         ([('CONDUIT', conduit),
           ('GASNET', gasnet_dir),
@@ -420,10 +426,11 @@ def driver(prefix_dir=None, scratch_dir=None, cache=False,
             git_clone(gasnet_dir, 'https://github.com/StanfordLegion/gasnet.git')
         if not cache:
             conduit = discover_conduit()
+            conduit_short = short_conduit(conduit)
             gasnet_release_dir = os.path.join(gasnet_dir, 'release')
             gasnet_build_result = os.path.join(
-                gasnet_release_dir, '%s-conduit' % conduit,
-                'libgasnet-%s-par.a' % conduit)
+                gasnet_release_dir, '%s-conduit' % conduit_short,
+                'libgasnet-%s-par.a' % conduit_short)
             if not os.path.exists(gasnet_release_dir):
                 try:
                     build_gasnet(gasnet_dir, conduit)

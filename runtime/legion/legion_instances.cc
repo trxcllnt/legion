@@ -1182,6 +1182,16 @@ namespace Legion {
     void PhysicalManager::notify_valid(ReferenceMutator *mutator)
     //--------------------------------------------------------------------------
     {
+#ifndef DEBUG_LEGION
+      // In non-debug mode we can just add the valid reference to the
+      // owner without needing to check. While this isn't strictly necessary
+      // for correctness, it is an important performance optimization to help
+      // the garbage collector quickly detect when instances should not be
+      // eligible for collection early in the process before trying to do
+      // the whole distributed protocol.
+      if (!is_owner())
+        send_remote_valid_increment(owner_space, mutator);
+#endif
       AutoLock i_lock(inst_lock);
 #ifdef DEBUG_LEGION
       assert(!deferred_deletion.exists());
@@ -1313,11 +1323,11 @@ namespace Legion {
     void PhysicalManager::notify_invalid(ReferenceMutator *mutator)
     //--------------------------------------------------------------------------
     {
+      if (!is_owner())
+        send_remote_valid_decrement(owner_space, mutator);
       AutoLock i_lock(inst_lock);
 #ifdef DEBUG_LEGION
       assert(gc_state == VALID_GC_STATE);
-      if (!is_owner())
-        send_remote_valid_decrement(owner_space, mutator);
 #endif
       if (pending_changes == 0)
       {
@@ -1507,16 +1517,21 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    bool PhysicalManager::try_collection(AddressSpaceID source, RtEvent &ready)
+    bool PhysicalManager::try_collection(AddressSpaceID source, RtEvent &ready,
+                                         bool &already_collected)
     //--------------------------------------------------------------------------
     {
+      already_collected = false;
       AutoLock i_lock(inst_lock);
       // Do a quick to check to see if we can do a collection on the local node
       if ((gc_state == ACQUIRED_GC_STATE) || (gc_state == VALID_GC_STATE))
         return false;
       // If it's already collected then we're done
       if (gc_state == COLLECTED_GC_STATE)
-        return true;
+      {
+        already_collected = true;
+        return false;
+      }
       if (is_owner())
       {
         // Check to see if anyone is already performing a deletion
@@ -1579,6 +1594,7 @@ namespace Legion {
           i_lock.release();
           // Send the message to the owner to perform the collection
           std::atomic<bool> result(false);
+          std::atomic<bool> collected(false);
           const RtUserEvent ready_event = Runtime::create_rt_user_event();
           Serializer rez;
           {
@@ -1586,10 +1602,12 @@ namespace Legion {
             rez.serialize(did);
             rez.serialize(ready_event);
             rez.serialize(&result);
+            rez.serialize(&collected);
             rez.serialize(&ready);
           }
           runtime->send_gc_request(owner_space, rez);
           ready_event.wait();
+          already_collected = collected.load();
           return result.load();
         }
         else
@@ -1615,8 +1633,9 @@ namespace Legion {
       derez.deserialize(did);
       RtUserEvent done;
       derez.deserialize(done);
-      std::atomic<bool> *result;
+      std::atomic<bool> *result, *collected;
       derez.deserialize(result);
+      derez.deserialize(collected);
       RtEvent *target;
       derez.deserialize(target);
 
@@ -1624,11 +1643,21 @@ namespace Legion {
           runtime->weak_find_distributed_collectable(did));
       if (manager == NULL)
       {
-        Runtime::trigger_event(done);
+        // This was already collected, so indicate that
+        Serializer rez;
+        {
+          RezCheck z2(rez);
+          rez.serialize(collected);
+          rez.serialize(target);
+          rez.serialize(RtEvent::NO_RT_EVENT);
+          rez.serialize(done);
+        }
+        runtime->send_gc_response(source, rez);
         return;
       }
       RtEvent ready;
-      if (manager->try_collection(source, ready))
+      bool already_collected = false;
+      if (manager->try_collection(source, ready, already_collected))
       {
         // Add a reference to ensure it is still there when 
         // we do the check or release
@@ -1639,6 +1668,19 @@ namespace Legion {
           rez.serialize(result);
           rez.serialize(target);
           rez.serialize(ready);
+          rez.serialize(done);
+        }
+        runtime->send_gc_response(source, rez);
+      }
+      else if (already_collected)
+      {
+        // This was already collected, so indicate that
+        Serializer rez;
+        {
+          RezCheck z2(rez);
+          rez.serialize(collected);
+          rez.serialize(target);
+          rez.serialize(RtEvent::NO_RT_EVENT);
           rez.serialize(done);
         }
         runtime->send_gc_response(source, rez);
@@ -1686,7 +1728,8 @@ namespace Legion {
       if (ready.exists() && !ready.has_triggered())
         ready.wait();
 
-      if (manager->try_collection(source, ready))
+      bool dummy_collected = false;
+      if (manager->try_collection(source, ready, dummy_collected))
       {
         Serializer rez;
         {
@@ -1698,6 +1741,9 @@ namespace Legion {
       }
       else
         Runtime::trigger_event(done);
+#ifdef DEBUG_LEGION
+      assert(!dummy_collected); // should never be set here
+#endif
     }
 
     //--------------------------------------------------------------------------
@@ -2637,7 +2683,7 @@ namespace Legion {
           dst_fields[idx].set_redop(reduction_op_id, false/*fold*/, 
                                     true/*exclusive*/);
       }
-      const ApEvent result = copy_expression->issue_copy(op, trace_info, 
+      const ApEvent result = copy_expression->issue_copy(op, trace_info,
                                          dst_fields, src_fields, reservations,
 #ifdef LEGION_SPY
                                          source_manager->tree_id, tree_id,
