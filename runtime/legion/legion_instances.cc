@@ -841,6 +841,16 @@ namespace Legion {
     void PhysicalManager::notify_valid(ReferenceMutator *mutator)
     //--------------------------------------------------------------------------
     {
+#ifndef DEBUG_LEGION
+      // In non-debug mode we can just add the valid reference to the
+      // owner without needing to check. While this isn't strictly necessary
+      // for correctness, it is an important performance optimization to help
+      // the garbage collector quickly detect when instances should not be
+      // eligible for collection early in the process before trying to do
+      // the whole distributed protocol.
+      if (!is_owner())
+        send_remote_valid_increment(owner_space, mutator);
+#endif
       AutoLock i_lock(inst_lock);
 #ifdef DEBUG_LEGION
       assert(!deferred_deletion.exists());
@@ -968,11 +978,11 @@ namespace Legion {
     void PhysicalManager::notify_invalid(ReferenceMutator *mutator)
     //--------------------------------------------------------------------------
     {
+      if (!is_owner())
+        send_remote_valid_decrement(owner_space, mutator);
       AutoLock i_lock(inst_lock);
 #ifdef DEBUG_LEGION
       assert(gc_state == VALID_GC_STATE);
-      if (!is_owner())
-        send_remote_valid_decrement(owner_space, mutator);
 #endif
       if (pending_changes == 0)
       {
@@ -2205,8 +2215,9 @@ namespace Legion {
       else
         across_helper->compute_across_offsets(copy_mask, dst_fields);
       source_manager->compute_copy_offsets(copy_mask, src_fields);
-      const ApEvent result = copy_expression->issue_copy(trace_info, 
-                                         dst_fields, src_fields,
+      const std::vector<Reservation> no_reservations{};
+      const ApEvent result = copy_expression->issue_copy(trace_info, dst_fields,
+                                         src_fields, no_reservations,
 #ifdef LEGION_SPY
                                          source_manager->tree_id, tree_id,
 #endif

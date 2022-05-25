@@ -469,7 +469,7 @@ ifeq ($(strip $(USE_HIP)),1)
     # Latter is preferred, former is for backwards compatability
     REALM_CC_FLAGS  += -DREALM_USE_HIP
     LEGION_CC_FLAGS += -DLEGION_USE_HIP
-    CC_FLAGS        += -D__HIP_PLATFORM_HCC__
+    CC_FLAGS        += -D__HIP_PLATFORM_AMD__
     HIPCC_FLAGS     += -fno-strict-aliasing
     INC_FLAGS       += -I$(HIP_PATH)/include -I$(HIP_PATH)/../include
     ifeq ($(strip $(DEBUG)),1)
@@ -490,8 +490,8 @@ ifeq ($(strip $(USE_HIP)),1)
     # Latter is preferred, former is for backwards compatability
     REALM_CC_FLAGS  += -DREALM_USE_HIP
     LEGION_CC_FLAGS += -DLEGION_USE_HIP
-    CC_FLAGS        += -D__HIP_PLATFORM_NVCC__
-    HIPCC_FLAGS     += -D__HIP_PLATFORM_NVCC__
+    CC_FLAGS        += -D__HIP_PLATFORM_NVIDIA__
+    HIPCC_FLAGS     += -D__HIP_PLATFORM_NVIDIA__
     INC_FLAGS       += -I$(CUDA_PATH)/include -I$(HIP_PATH)/include  -I$(HIP_PATH)/../include
     ifeq ($(strip $(DEBUG)),1)
       HIPCC_FLAGS	+= -g -O0
@@ -725,11 +725,9 @@ ifeq ($(strip $(USE_HDF)), 1)
   endif
 endif
 
-SKIP_MACHINES= titan% daint% excalibur% cori%
-# use mpi{cc,cxx,f90} compiler wrappers if USE_MPI=1
+# use mpi{cc,cxx,f90} compiler wrappers if USE_MPI=1 and we're not on a Cray system
 ifeq ($(strip $(USE_MPI)),1)
-  # Skip any machines on this list list
-  ifeq ($(filter-out $(SKIP_MACHINES),$(shell uname -n)),$(shell uname -n))
+  ifeq (${CRAYPE_VERSION},)
     # OpenMPI check
     ifneq ($(strip $(shell __INTEL_POST_CFLAGS+=' -we10006' $(CC) -showme:compile 2>&1 > /dev/null; echo $$?)),0)
       # MPICH check
@@ -883,8 +881,7 @@ HIP_SRC         ?=
 # Backwards compatibility for older makefiles
 GEN_GPU_SRC	?= 
 CUDA_SRC	+= $(GEN_GPU_SRC)
-GEN_HIP_SRC     ?=
-HIP_SRC         += $(GEN_HIP_SRC)
+HIP_SRC         += $(GEN_GPU_SRC)
 REALM_SRC	?=
 LEGION_SRC	?=
 LEGION_CUDA_SRC	?=
@@ -1112,6 +1109,10 @@ INSTALL_HEADERS += legion.h \
 ifeq ($(strip $(USE_CUDA)),1)
 INSTALL_HEADERS += realm/cuda/cuda_redop.h
 endif
+ifeq ($(strip $(USE_HIP)),1)
+INSTALL_HEADERS += hip_cuda_compat/hip_cuda.h \
+                   realm/hip/hip_redop.h
+endif
 ifeq ($(strip $(USE_HALF)),1)
 INSTALL_HEADERS += mathtypes/half.h
 endif
@@ -1258,11 +1259,11 @@ $(SLIB_REALM) : $(REALM_OBJS) $(REALM_INST_OBJS)
 else
 $(SLIB_LEGION) : $(LEGION_OBJS) $(LEGION_INST_OBJS) $(MAPPER_OBJS) $(SLIB_REALM)
 	rm -f $@
-	$(CXX) $(SO_FLAGS) -o $@ $(LEGION_OBJS) $(LEGION_INST_OBJS) $(MAPPER_OBJS) $(SLIB_LEGION_DEPS)
+	$(CXX) $(SO_FLAGS) -o $@ $(LEGION_OBJS) $(LEGION_INST_OBJS) $(MAPPER_OBJS) $(LD_FLAGS) $(SLIB_LEGION_DEPS)
 
 $(SLIB_REALM) : $(REALM_OBJS) $(REALM_INST_OBJS)
 	rm -f $@
-	$(CXX) $(SO_FLAGS) -o $@ $^ $(SLIB_REALM_DEPS)
+	$(CXX) $(SO_FLAGS) -o $@ $^ $(LD_FLAGS) $(SLIB_REALM_DEPS)
 endif
 
 $(filter %.c.o,$(APP_OBJS)) : %.c.o : %.c $(LEGION_DEFINES_HEADER) $(REALM_DEFINES_HEADER)
